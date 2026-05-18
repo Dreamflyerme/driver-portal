@@ -796,7 +796,7 @@ async function loadAdmin() {
   clearAdminError();
 
   try {
-    const res = await fetch('/api/admin/config');
+    const res = await fetch('/data/admin/config');
     const text = await res.text();
 
     if (!res.ok) {
@@ -848,7 +848,7 @@ async function addUser() {
     return;
   }
 
-  const res = await fetch('/api/admin/user', {
+  const res = await fetch('/data/admin/user', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({username, password, role})
@@ -869,7 +869,7 @@ async function addUser() {
 async function deleteUser(username) {
   if (!confirm('Delete user ' + username + '?')) return;
 
-  const res = await fetch('/api/admin/user/delete', {
+  const res = await fetch('/data/admin/user/delete', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({username})
@@ -889,7 +889,7 @@ async function changePassword(username) {
   const password = prompt('Enter new password for ' + username);
   if (!password) return;
 
-  const res = await fetch('/api/admin/user/password', {
+  const res = await fetch('/data/admin/user/password', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({username, password})
@@ -1110,7 +1110,7 @@ async function addCustomFlow() {
   const button_class = document.getElementById('newFlowStyle').value;
   if (!label) return alert('Enter a flow label.');
 
-  const res = await fetch('/api/admin/custom-flow', {
+  const res = await fetch('/data/admin/custom-flow', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({key: makeFlowKey(label), label, button_class, active: true, display_order: 500, steps: []})
   });
@@ -1128,7 +1128,7 @@ async function addCustomFlow() {
 async function seedV2Defaults() {
   if (!confirm('Create V2 dynamic copies of the current built-in driver options? Existing V2 copies will not be duplicated.')) return;
 
-  const res = await fetch('/api/admin/seed-v2-flows', {
+  const res = await fetch('/data/admin/seed-v2-flows', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({})
   });
@@ -1150,7 +1150,7 @@ async function saveCustomFlow(key, id) {
   const active = document.getElementById('flow_active_' + id).checked;
   if (!label) return alert('Flow label cannot be blank.');
 
-  const res = await fetch('/api/admin/custom-flow', {
+  const res = await fetch('/data/admin/custom-flow', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({key, label, display_order, button_class, active})
   });
@@ -1166,7 +1166,7 @@ async function saveCustomFlow(key, id) {
 
 async function deleteCustomFlow(key) {
   if (!confirm('Delete this custom flow?')) return;
-  await fetch('/api/admin/custom-flow/delete', {
+  await fetch('/data/admin/custom-flow/delete', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({key})
   });
@@ -1193,7 +1193,7 @@ async function addFlowStep(flowKey, id) {
     step.show_if = { field: showField, equals: showValue };
   }
 
-  await fetch('/api/admin/custom-flow/step', {
+  await fetch('/data/admin/custom-flow/step', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({flow_key: flowKey, step})
   });
@@ -1202,7 +1202,7 @@ async function addFlowStep(flowKey, id) {
 
 async function deleteFlowStep(flowKey, stepId) {
   if (!confirm('Delete this step?')) return;
-  await fetch('/api/admin/custom-flow/step/delete', {
+  await fetch('/data/admin/custom-flow/step/delete', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({flow_key: flowKey, step_id: stepId})
   });
@@ -1234,7 +1234,7 @@ async function addQueue() {
   const name = document.getElementById('newQueueName').value.trim();
   if (!name) return alert('Enter a queue name.');
 
-  const res = await fetch('/api/admin/queue', {
+  const res = await fetch('/data/admin/queue', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name})
   });
@@ -1254,7 +1254,7 @@ async function addQueue() {
 
 async function deleteQueue(name) {
   if (!confirm('Delete queue "' + name + '"?')) return;
-  const res = await fetch('/api/admin/queue/delete', {
+  const res = await fetch('/data/admin/queue/delete', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name})
   });
@@ -1267,7 +1267,7 @@ async function addDepot() {
   const name = document.getElementById('newDepotName').value.trim();
   const dispatch_queue = document.getElementById('newDepotQueue').value;
   if (!name || !dispatch_queue) return alert('Enter depot and queue.');
-  await fetch('/api/admin/depot', {
+  await fetch('/data/admin/depot', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name, dispatch_queue})
   });
@@ -1277,7 +1277,7 @@ async function addDepot() {
 
 async function saveDepot(name, id) {
   const dispatch_queue = document.getElementById('d_queue_' + id).value;
-  await fetch('/api/admin/depot', {
+  await fetch('/data/admin/depot', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name, dispatch_queue})
   });
@@ -1286,7 +1286,7 @@ async function saveDepot(name, id) {
 
 async function deleteDepot(name) {
   if (!confirm('Delete depot "' + name + '"?')) return;
-  await fetch('/api/admin/depot/delete', {
+  await fetch('/data/admin/depot/delete', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name})
   });
@@ -1299,7 +1299,7 @@ async function addProfile() {
   if (!name) return alert('Enter a profile name.');
   if (queues.length === 0) return alert('Select at least one queue.');
 
-  await fetch('/api/admin/profile', {
+  await fetch('/data/admin/profile', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name, queues})
   });
@@ -1311,7 +1311,7 @@ async function saveProfile(name, containerId) {
   const queues = getCheckedQueues(containerId);
   if (queues.length === 0) return alert('Select at least one queue.');
 
-  await fetch('/api/admin/profile', {
+  await fetch('/data/admin/profile', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name, queues})
   });
@@ -1321,7 +1321,7 @@ async function saveProfile(name, containerId) {
 async function deleteProfile(name) {
   if (!confirm('Delete profile "' + name + '"?')) return;
 
-  await fetch('/api/admin/profile/delete', {
+  await fetch('/data/admin/profile/delete', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name})
   });
@@ -1570,7 +1570,7 @@ async function saveCurrentAsProfile() {
     return;
   }
 
-  await fetch('/api/admin/profile', {
+  await fetch('/data/admin/profile', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name: name.trim(), queues})
@@ -1812,7 +1812,7 @@ async function loadRequests() {
   params.set('queues', queues.join(','));
   if (supplySearch.trim()) params.set('supply_search', supplySearch.trim());
 
-  const res = await fetch('/api/requests?' + params.toString());
+  const res = await fetch('/data/requests?' + params.toString());
   const data = await res.json();
   currentRows = data;
   renderSortIndicators();
@@ -1820,7 +1820,7 @@ async function loadRequests() {
 }
 
 async function setStatus(id, status) {
-  await fetch('/api/status', {
+  await fetch('/data/status', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, status })
@@ -1855,7 +1855,7 @@ function modalBackdropClicked(event) {
 async function saveNotes() {
   if (!activeNotesRequestId) return;
   const notes = document.getElementById('notesText').value.trim();
-  await fetch('/api/notes', {
+  await fetch('/data/notes', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id: activeNotesRequestId, notes })
@@ -1890,7 +1890,7 @@ function closeReassignMenu() {
 }
 
 async function reassignQueue(id, queue) {
-  await fetch('/api/reassign', {
+  await fetch('/data/reassign', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, dispatch_queue: queue })
@@ -2070,6 +2070,7 @@ def submit():
 
 
 @app.route("/api/requests")
+@app.route("/data/requests")
 def api_requests():
     view = request.args.get("view", "separate")
     queues_raw = request.args.get("queues", "")
@@ -2104,6 +2105,7 @@ def api_requests():
 
 
 @app.route("/api/status", methods=["POST"])
+@app.route("/data/status", methods=["POST"])
 def api_status():
     data = request.get_json(force=True)
     req_id = data.get("id")
@@ -2120,6 +2122,7 @@ def api_status():
 
 
 @app.route("/api/notes", methods=["POST"])
+@app.route("/data/notes", methods=["POST"])
 def api_notes():
     data = request.get_json(force=True)
     req_id = data.get("id")
@@ -2136,6 +2139,7 @@ def api_notes():
 
 
 @app.route("/api/reassign", methods=["POST"])
+@app.route("/data/reassign", methods=["POST"])
 def api_reassign():
     data = request.get_json(force=True)
     req_id = data.get("id")
@@ -2159,6 +2163,7 @@ def api_reassign():
 
 
 @app.route("/api/admin/config")
+@app.route("/data/admin/config")
 def api_admin_config():
     if not require_role("admin"):
         return jsonify({"error": "Not authorised"}), 403
@@ -2187,6 +2192,7 @@ def api_admin_config():
 
 
 @app.route("/api/admin/user", methods=["POST"])
+@app.route("/data/admin/user", methods=["POST"])
 def api_admin_user():
     data = request.get_json(force=True)
 
@@ -2211,6 +2217,7 @@ def api_admin_user():
 
 
 @app.route("/api/admin/user/password", methods=["POST"])
+@app.route("/data/admin/user/password", methods=["POST"])
 def api_admin_user_password():
     data = request.get_json(force=True)
 
@@ -2239,6 +2246,7 @@ def api_admin_user_password():
 
 
 @app.route("/api/admin/user/delete", methods=["POST"])
+@app.route("/data/admin/user/delete", methods=["POST"])
 def api_admin_user_delete():
     data = request.get_json(force=True)
     username = str(data.get("username", "")).strip()
@@ -2254,6 +2262,7 @@ def api_admin_user_delete():
 
 
 @app.route("/api/admin/queue", methods=["POST"])
+@app.route("/data/admin/queue", methods=["POST"])
 def api_admin_queue():
     data = request.get_json(force=True)
     name = str(data.get("name", "")).strip()
@@ -2270,6 +2279,7 @@ def api_admin_queue():
 
 
 @app.route("/api/admin/queue/delete", methods=["POST"])
+@app.route("/data/admin/queue/delete", methods=["POST"])
 def api_admin_queue_delete():
     data = request.get_json(force=True)
     name = str(data.get("name", "")).strip()
@@ -2286,6 +2296,7 @@ def api_admin_queue_delete():
 
 
 @app.route("/api/admin/depot", methods=["POST"])
+@app.route("/data/admin/depot", methods=["POST"])
 def api_admin_depot():
     data = request.get_json(force=True)
     name = str(data.get("name", "")).strip()
@@ -2305,6 +2316,7 @@ def api_admin_depot():
 
 
 @app.route("/api/admin/depot/delete", methods=["POST"])
+@app.route("/data/admin/depot/delete", methods=["POST"])
 def api_admin_depot_delete():
     data = request.get_json(force=True)
     name = str(data.get("name", "")).strip()
@@ -2318,6 +2330,7 @@ def api_admin_depot_delete():
 
 
 @app.route("/api/admin/profile", methods=["POST"])
+@app.route("/data/admin/profile", methods=["POST"])
 def api_admin_profile():
     data = request.get_json(force=True)
     name = str(data.get("name", "")).strip()
@@ -2342,6 +2355,7 @@ def api_admin_profile():
 
 
 @app.route("/api/admin/profile/delete", methods=["POST"])
+@app.route("/data/admin/profile/delete", methods=["POST"])
 def api_admin_profile_delete():
     data = request.get_json(force=True)
     name = str(data.get("name", "")).strip()
@@ -2355,6 +2369,7 @@ def api_admin_profile_delete():
 
 
 @app.route("/api/admin/custom-flow", methods=["POST"])
+@app.route("/data/admin/custom-flow", methods=["POST"])
 def api_admin_custom_flow():
     data = request.get_json(force=True)
     key = str(data.get("key", "")).strip()
@@ -2399,6 +2414,7 @@ def api_admin_custom_flow():
 
 
 @app.route("/api/admin/custom-flow/delete", methods=["POST"])
+@app.route("/data/admin/custom-flow/delete", methods=["POST"])
 def api_admin_custom_flow_delete():
     data = request.get_json(force=True)
     key = str(data.get("key", "")).strip()
@@ -2409,6 +2425,7 @@ def api_admin_custom_flow_delete():
 
 
 @app.route("/api/admin/seed-v2-flows", methods=["POST"])
+@app.route("/data/admin/seed-v2-flows", methods=["POST"])
 def api_admin_seed_v2_flows():
     config = load_config()
     flows = config.get("custom_flows", [])
@@ -2426,6 +2443,7 @@ def api_admin_seed_v2_flows():
 
 
 @app.route("/api/admin/custom-flow/step", methods=["POST"])
+@app.route("/data/admin/custom-flow/step", methods=["POST"])
 def api_admin_custom_flow_step():
     data = request.get_json(force=True)
     flow_key = str(data.get("flow_key", "")).strip()
@@ -2474,6 +2492,7 @@ def api_admin_custom_flow_step():
 
 
 @app.route("/api/admin/custom-flow/step/delete", methods=["POST"])
+@app.route("/data/admin/custom-flow/step/delete", methods=["POST"])
 def api_admin_custom_flow_step_delete():
     data = request.get_json(force=True)
     flow_key = str(data.get("flow_key", "")).strip()
