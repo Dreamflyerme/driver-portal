@@ -770,7 +770,7 @@ ADMIN_HTML = """
 </div>
 
 <script>
-let adminData = null;
+let adminData = {{ admin_initial_data|tojson }};
 
 function escapeHtml(value) {
   return String(value || '')
@@ -793,28 +793,41 @@ function clearAdminError() {
   box.innerText = '';
 }
 
+function renderAdminFromData() {
+  renderUsers();
+  renderQueues();
+  renderDepots();
+  renderNewDepotQueue();
+  renderProfiles();
+  renderNewProfileQueues();
+  renderCustomFlows();
+}
+
 async function loadAdmin() {
   clearAdminError();
 
+  // First render from server-embedded data. This avoids corporate browsers/networks
+  // that block JavaScript fetch/XHR calls but still allow normal page loads.
+  if (adminData) {
+    renderAdminFromData();
+  }
+
+  // Then try to refresh in the background. If fetch is blocked, keep the embedded data.
   try {
     const res = await fetch('/data/admin/config');
     const text = await res.text();
 
     if (!res.ok) {
-      showAdminError('Admin config failed to load: HTTP ' + res.status + ' - ' + text.slice(0, 500));
+      showAdminError('Live refresh failed: HTTP ' + res.status + ' - ' + text.slice(0, 500));
       return;
     }
 
     adminData = JSON.parse(text);
-    renderUsers();
-    renderQueues();
-    renderDepots();
-    renderNewDepotQueue();
-    renderProfiles();
-    renderNewProfileQueues();
-    renderCustomFlows();
+    renderAdminFromData();
   } catch (err) {
-    showAdminError('Admin config failed to load: ' + err);
+    if (!adminData) {
+      showAdminError('Admin config failed to load: ' + err);
+    }
   }
 }
 
@@ -2015,12 +2028,26 @@ def dispatcher():
     )
 
 
+def get_admin_data():
+    config = load_config()
+    with db_connect() as conn:
+        users = [dict(r) for r in conn.execute("SELECT id, username, role, active FROM users ORDER BY username").fetchall()]
+
+    return {
+        "users": users,
+        "queues": sorted(config.get("queues", [])),
+        "depots": get_depots(),
+        "dispatcher_profiles": get_dispatcher_profiles(),
+        "custom_flows": get_custom_flows(active_only=False),
+    }
+
+
 @app.route("/admin")
 def admin():
     if not require_role("admin"):
         return redirect(url_for("login"))
 
-    return render_template_string(ADMIN_HTML)
+    return render_template_string(ADMIN_HTML, admin_initial_data=get_admin_data())
 
 
 @app.route("/submit", methods=["POST"])
@@ -2170,24 +2197,15 @@ def api_admin_config():
         return jsonify({"error": "Not authorised"}), 403
 
     try:
-        config = load_config()
-        with db_connect() as conn:
-            users = [dict(r) for r in conn.execute("SELECT id, username, role, active FROM users ORDER BY username").fetchall()]
-
-        return jsonify({
-            "users": users,
-            "queues": sorted(config.get("queues", [])),
-            "depots": get_depots(),
-            "dispatcher_profiles": get_dispatcher_profiles(),
-            "custom_flows": get_custom_flows(active_only=False),
-            "debug": {
-                "base_dir": str(BASE_DIR),
-                "config_path": str(CONFIG_PATH),
-                "config_exists": CONFIG_PATH.exists(),
-                "db_path": str(DB_PATH),
-                "db_exists": DB_PATH.exists(),
-            }
-        })
+        data = get_admin_data()
+        data["debug"] = {
+            "base_dir": str(BASE_DIR),
+            "config_path": str(CONFIG_PATH),
+            "config_exists": CONFIG_PATH.exists(),
+            "db_path": str(DB_PATH),
+            "db_exists": DB_PATH.exists(),
+        }
+        return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e), "config_path": str(CONFIG_PATH), "db_path": str(DB_PATH)}), 500
 
@@ -2512,6 +2530,14 @@ def api_admin_custom_flow_step_delete():
 # Run setup at import time as well as local run time.
 # This is required for hosted deployments such as Render/Gunicorn,
 # because gunicorn imports app:app and does not execute the __main__ block.
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 ensure_config_file()
 init_db()
 
