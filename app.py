@@ -1448,6 +1448,7 @@ DISPATCHER_HTML = """
 <body>
 <div class="wrap">
   <h1>Dispatcher Board</h1>
+  <div id="dispatcherError" class="card" style="display:none; border-left:6px solid #dc2626; color:#991b1b;"></div>
   <p class="muted"><a href="/admin">Dispatcher Admin</a></p>
 
   <div class="card">
@@ -1518,6 +1519,7 @@ DISPATCHER_HTML = """
 <script>
 const DISPATCH_QUEUES = {{ dispatch_queues|tojson }};
 const DISPATCHER_PROFILES = {{ dispatcher_profiles|tojson }};
+const INITIAL_REQUESTS = {{ initial_requests|tojson }};
 let currentView = localStorage.getItem('dispatcher_view') || 'separate';
 let currentRows = [];
 let activeNotesRequestId = null;
@@ -1812,6 +1814,37 @@ function renderRows(data) {
   }
 }
 
+function showDispatcherError(message) {
+  const box = document.getElementById('dispatcherError');
+  box.style.display = 'block';
+  box.innerText = message;
+}
+
+function clearDispatcherError() {
+  const box = document.getElementById('dispatcherError');
+  box.style.display = 'none';
+  box.innerText = '';
+}
+
+function filterRowsLocally(rows, queues) {
+  let filtered = rows.filter(r => queues.includes(r.dispatch_queue));
+
+  if (currentView !== 'combined') {
+    filtered = filtered.filter(r => r.status !== 'Done');
+  }
+
+  if (supplySearch.trim()) {
+    const s = supplySearch.trim().toLowerCase();
+    filtered = filtered.filter(r =>
+      String(r.supply_search || '').toLowerCase().includes(s) ||
+      String(r.supply_number || '').toLowerCase().includes(s) ||
+      String(r.payload_json || '').toLowerCase().includes(s)
+    );
+  }
+
+  return filtered;
+}
+
 async function loadRequests() {
   const queues = getSelectedQueues();
   const tbody = document.getElementById('rows');
@@ -1826,11 +1859,26 @@ async function loadRequests() {
   params.set('queues', queues.join(','));
   if (supplySearch.trim()) params.set('supply_search', supplySearch.trim());
 
-  const res = await fetch('/data/requests?' + params.toString());
-  const data = await res.json();
-  currentRows = data;
-  renderSortIndicators();
-  renderRows(data);
+  try {
+    const res = await fetch('/data/requests?' + params.toString());
+    const text = await res.text();
+
+    if (!res.ok) {
+      throw new Error('HTTP ' + res.status + ' - ' + text.slice(0, 250));
+    }
+
+    const data = JSON.parse(text);
+    currentRows = data;
+    clearDispatcherError();
+    renderSortIndicators();
+    renderRows(data);
+  } catch (err) {
+    // Corporate browsers/networks can block fetch/XHR. Fall back to rows embedded in the page.
+    currentRows = filterRowsLocally(INITIAL_REQUESTS, queues);
+    showDispatcherError('Live refresh failed. Showing page-load snapshot only: ' + err);
+    renderSortIndicators();
+    renderRows(currentRows);
+  }
 }
 
 async function setStatus(id, status) {
@@ -2016,6 +2064,15 @@ custom_flows=get_custom_flows(active_only=True),
     )
 
 
+def get_initial_requests(limit=200):
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM requests ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 @app.route("/dispatcher")
 def dispatcher():
     if not require_role("dispatcher", "admin"):
@@ -2025,6 +2082,7 @@ def dispatcher():
         DISPATCHER_HTML,
         dispatch_queues=get_dispatch_queues(),
         dispatcher_profiles=get_dispatcher_profiles(),
+        initial_requests=get_initial_requests(),
     )
 
 
