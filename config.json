@@ -1,0 +1,182 @@
+{
+  "queues": [
+    "Clandeboye",
+    "Darfield",
+    "Edendale"
+  ],
+  "depots": {
+    "Amberly": "Darfield",
+    "Ashburton": "Clandeboye",
+    "Brightwater": "Darfield",
+    "Clandeboye": "Clandeboye",
+    "Darfield": "Darfield",
+    "Edendale": "Edendale",
+    "Stirling": "Edendale",
+    "Studholme": "Clandeboye",
+    "Takaka": "Darfield",
+    "Winton": "Edendale"
+  },
+  "dispatcher_profiles": {
+    "Central South": [
+      "Clandeboye",
+      "Darfield"
+    ],
+    "Lower South": [
+      "Edendale"
+    ]
+  },
+  "driver_options": [
+    {
+      "key": "CALL_ME",
+      "label": "Call me please",
+      "active": true,
+      "display_order": 10,
+      "button_class": "warning"
+    },
+    {
+      "key": "MILK_LEFT_BEHIND",
+      "label": "Milk Left Behind",
+      "active": true,
+      "display_order": 20,
+      "button_class": "request"
+    },
+    {
+      "key": "CIP",
+      "label": "CIP",
+      "active": true,
+      "display_order": 30,
+      "button_class": "request"
+    },
+    {
+      "key": "SUPPLIER_MILKING",
+      "label": "Supplier Milking",
+      "active": true,
+      "display_order": 40,
+      "button_class": "primary"
+    },
+    {
+      "key": "SPLIT_CLEARED",
+      "label": "Split has been cleared",
+      "active": true,
+      "display_order": 50,
+      "button_class": "primary"
+    },
+    {
+      "key": "DRIVER_MESSAGE",
+      "label": "Send Message",
+      "active": true,
+      "display_order": 60,
+      "button_class": "muted"
+    }
+  ],
+  "custom_flows": [
+    {
+      "key": "V2_CALL_ME",
+      "label": "Call me please V2",
+      "active": true,
+      "display_order": 110,
+      "button_class": "request",
+      "steps": []
+    },
+    {
+      "key": "V2_MILK_LEFT_BEHIND",
+      "label": "Milk Left Behind V2",
+      "active": true,
+      "display_order": 120,
+      "button_class": "request",
+      "steps": [
+        {
+          "id": "supply_number",
+          "type": "number",
+          "label": "Supply Number",
+          "required": true
+        },
+        {
+          "id": "volume_band",
+          "type": "choice",
+          "label": "Volume Band",
+          "required": true,
+          "choices": [
+            "0-500L",
+            "500-1200L",
+            "1200L+"
+          ]
+        },
+        {
+          "id": "milk_still_stirred",
+          "type": "yes_no",
+          "label": "Is milk still being stirred?",
+          "required": true,
+          "show_if": {
+            "field": "volume_band",
+            "equals": "0-500L"
+          }
+        }
+      ]
+    },
+    {
+      "key": "V2_CIP",
+      "label": "CIP V2",
+      "active": true,
+      "display_order": 130,
+      "button_class": "warning",
+      "steps": [
+        {
+          "id": "cip_action",
+          "type": "choice",
+          "label": "CIP Action",
+          "required": true,
+          "choices": [
+            "Remove my CIP",
+            "Add CIP EOD"
+          ]
+        }
+      ]
+    },
+    {
+      "key": "V2_SUPPLIER_MILKING",
+      "label": "Supplier Milking V2",
+      "active": true,
+      "display_order": 140,
+      "button_class": "request",
+      "steps": [
+        {
+          "id": "supply_number",
+          "type": "number",
+          "label": "Supply Number",
+          "required": true
+        }
+      ]
+    },
+    {
+      "key": "V2_SPLIT_CLEARED",
+      "label": "Split has been cleared V2",
+      "active": true,
+      "display_order": 150,
+      "button_class": "request",
+      "steps": [
+        {
+          "id": "supply_number",
+          "type": "number",
+          "label": "Supply Number",
+          "required": true
+        }
+      ]
+    },
+    {
+      "key": "V2_DRIVER_MESSAGE",
+      "label": "Send Message V2",
+      "active": true,
+      "display_order": 160,
+      "button_class": "primary",
+      "steps": [
+        {
+          "id": "message",
+          "type": "message",
+          "label": "Message",
+          "required": true
+        }
+      ]
+    }
+  ]
+}
