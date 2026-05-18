@@ -6,8 +6,9 @@ from pathlib import Path
 from werkzeug.security import generate_password_hash, check_password_hash
 
 APP_TITLE = "Driver Request Portal"
-DB_PATH = Path("requests.db")
-CONFIG_PATH = Path("config.json")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "requests.db"
+CONFIG_PATH = BASE_DIR / "config.json"
 
 # Driver request workflows are config-driven through custom_flows in config.json.
 DEFAULT_CONFIG = {
@@ -680,6 +681,7 @@ ADMIN_HTML = """
 <body>
 <div class="wrap">
   <h1>Dispatcher Admin</h1>
+  <div id="adminError" class="card" style="display:none; border-left:6px solid #dc2626; color:#991b1b;"></div>
   <p class="muted"><a href="/dispatcher">Back to Dispatcher Board</a></p>
 
   <div class="card">
@@ -778,16 +780,41 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
+function showAdminError(message) {
+  const box = document.getElementById('adminError');
+  box.style.display = 'block';
+  box.innerText = message;
+}
+
+function clearAdminError() {
+  const box = document.getElementById('adminError');
+  box.style.display = 'none';
+  box.innerText = '';
+}
+
 async function loadAdmin() {
-  const res = await fetch('/api/admin/config');
-  adminData = await res.json();
-  renderUsers();
-  renderQueues();
-  renderDepots();
-  renderNewDepotQueue();
-  renderProfiles();
-  renderNewProfileQueues();
-  renderCustomFlows();
+  clearAdminError();
+
+  try {
+    const res = await fetch('/api/admin/config');
+    const text = await res.text();
+
+    if (!res.ok) {
+      showAdminError('Admin config failed to load: HTTP ' + res.status + ' - ' + text.slice(0, 500));
+      return;
+    }
+
+    adminData = JSON.parse(text);
+    renderUsers();
+    renderQueues();
+    renderDepots();
+    renderNewDepotQueue();
+    renderProfiles();
+    renderNewProfileQueues();
+    renderCustomFlows();
+  } catch (err) {
+    showAdminError('Admin config failed to load: ' + err);
+  }
 }
 
 function renderUsers() {
@@ -1206,10 +1233,21 @@ function renderDepots() {
 async function addQueue() {
   const name = document.getElementById('newQueueName').value.trim();
   if (!name) return alert('Enter a queue name.');
-  await fetch('/api/admin/queue', {
+
+  const res = await fetch('/api/admin/queue', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({name})
   });
+
+  const text = await res.text();
+  let data = {};
+  try { data = JSON.parse(text); } catch {}
+
+  if (!res.ok) {
+    alert(data.error || text || 'Failed to add queue.');
+    return;
+  }
+
   document.getElementById('newQueueName').value = '';
   loadAdmin();
 }
@@ -2122,17 +2160,30 @@ def api_reassign():
 
 @app.route("/api/admin/config")
 def api_admin_config():
-    config = load_config()
-    with db_connect() as conn:
-        users = [dict(r) for r in conn.execute("SELECT id, username, role, active FROM users ORDER BY username").fetchall()]
+    if not require_role("admin"):
+        return jsonify({"error": "Not authorised"}), 403
 
-    return jsonify({
-        "users": users,
-        "queues": sorted(config.get("queues", [])),
-        "depots": get_depots(),
-        "dispatcher_profiles": get_dispatcher_profiles(),
-        "custom_flows": get_custom_flows(active_only=False),
-    })
+    try:
+        config = load_config()
+        with db_connect() as conn:
+            users = [dict(r) for r in conn.execute("SELECT id, username, role, active FROM users ORDER BY username").fetchall()]
+
+        return jsonify({
+            "users": users,
+            "queues": sorted(config.get("queues", [])),
+            "depots": get_depots(),
+            "dispatcher_profiles": get_dispatcher_profiles(),
+            "custom_flows": get_custom_flows(active_only=False),
+            "debug": {
+                "base_dir": str(BASE_DIR),
+                "config_path": str(CONFIG_PATH),
+                "config_exists": CONFIG_PATH.exists(),
+                "db_path": str(DB_PATH),
+                "db_exists": DB_PATH.exists(),
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "config_path": str(CONFIG_PATH), "db_path": str(DB_PATH)}), 500
 
 
 @app.route("/api/admin/user", methods=["POST"])
