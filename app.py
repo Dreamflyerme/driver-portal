@@ -18,7 +18,7 @@ DEFAULT_CONFIG = {
 }
 
 app = Flask(__name__)
-app.secret_key = "CHANGE_THIS_SECRET_KEY"
+app.secret_key = "NickPortal_2026_4j7sK92!xP"
 
 
 def ensure_config_file():
