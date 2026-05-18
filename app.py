@@ -18,7 +18,7 @@ DEFAULT_CONFIG = {
 }
 
 app = Flask(__name__)
-app.secret_key = "NickPortal_2026_4j7sK92!xP"
+app.secret_key = "CHANGE_THIS_SECRET_KEY"
 
 
 def ensure_config_file():
@@ -2438,7 +2438,11 @@ def api_admin_custom_flow_step_delete():
     return jsonify({"error": "Flow not found"}), 404
 
 
+# Run setup at import time as well as local run time.
+# This is required for hosted deployments such as Render/Gunicorn,
+# because gunicorn imports app:app and does not execute the __main__ block.
+ensure_config_file()
+init_db()
+
 if __name__ == "__main__":
-    ensure_config_file()
-    init_db()
     app.run(host="0.0.0.0", port=5000, debug=False)
