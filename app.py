@@ -1573,7 +1573,7 @@ function loadSelectedProfile() {
   localStorage.setItem('dispatcher_profile', name);
   document.getElementById('profileNote').innerText = 'Loaded desk: ' + name;
   renderQueueChoices();
-  loadRequests();
+  renderSnapshotRows();
 }
 
 async function saveCurrentAsProfile() {
@@ -1617,19 +1617,19 @@ function renderQueueChoices() {
 function queueChanged() {
   const queues = Array.from(document.querySelectorAll('#queueChoices input:checked')).map(x => x.value);
   saveSelectedQueues(queues);
-  loadRequests();
+  renderSnapshotRows();
 }
 
 function selectAllQueues() {
   saveSelectedQueues(DISPATCH_QUEUES);
   renderQueueChoices();
-  loadRequests();
+  renderSnapshotRows();
 }
 
 function clearQueues() {
   saveSelectedQueues([]);
   renderQueueChoices();
-  loadRequests();
+  renderSnapshotRows();
 }
 
 function setView(view) {
@@ -1640,20 +1640,20 @@ function setView(view) {
   document.getElementById('viewNote').innerText = view === 'separate'
     ? 'Separate hides Done items from the main board.'
     : 'Combined shows New, Acknowledged, and Done items. Done items can be restored.';
-  loadRequests();
+  renderSnapshotRows();
 }
 
 function supplySearchChanged() {
   supplySearch = document.getElementById('supplySearch').value.trim();
   localStorage.setItem('dispatcher_supply_search', supplySearch);
-  loadRequests();
+  renderSnapshotRows();
 }
 
 function clearSupplySearch() {
   supplySearch = '';
   localStorage.removeItem('dispatcher_supply_search');
   document.getElementById('supplySearch').value = '';
-  loadRequests();
+  renderSnapshotRows();
 }
 
 function detailText(r) {
@@ -1845,40 +1845,24 @@ function filterRowsLocally(rows, queues) {
   return filtered;
 }
 
-async function loadRequests() {
+function renderSnapshotRows() {
   const queues = getSelectedQueues();
   const tbody = document.getElementById('rows');
 
   if (queues.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="12" class="muted">Select at least one queue to monitor.</td></tr>'; 
+    tbody.innerHTML = '<tr><td colspan="12" class="muted">Select at least one queue to monitor.</td></tr>';
     return;
   }
 
-  const params = new URLSearchParams();
-  params.set('view', currentView);
-  params.set('queues', queues.join(','));
-  if (supplySearch.trim()) params.set('supply_search', supplySearch.trim());
+  currentRows = filterRowsLocally(INITIAL_REQUESTS, queues);
+  renderSortIndicators();
+  renderRows(currentRows);
+}
 
-  try {
-    const res = await fetch('/data/requests?' + params.toString());
-    const text = await res.text();
-
-    if (!res.ok) {
-      throw new Error('HTTP ' + res.status + ' - ' + text.slice(0, 250));
-    }
-
-    const data = JSON.parse(text);
-    currentRows = data;
-    clearDispatcherError();
-    renderSortIndicators();
-    renderRows(data);
-  } catch (err) {
-    // Corporate browsers/networks can block fetch/XHR. Fall back to rows embedded in the page.
-    currentRows = filterRowsLocally(INITIAL_REQUESTS, queues);
-    showDispatcherError('Live refresh failed. Showing page-load snapshot only: ' + err);
-    renderSortIndicators();
-    renderRows(currentRows);
-  }
+async function loadRequests() {
+  // Do not rely on fetch/XHR for the dispatcher board.
+  // Some corporate networks allow normal page loads but block JavaScript fetch calls.
+  renderSnapshotRows();
 }
 
 async function setStatus(id, status) {
@@ -1981,10 +1965,21 @@ document.getElementById('notesText').addEventListener('input', () => {
 
 document.getElementById('supplySearch').value = supplySearch;
 renderProfileChoices();
+
+// First time on a new PC/browser: default to all queues so the board is not blank.
+if (getSelectedQueues().length === 0 && DISPATCH_QUEUES.length > 0) {
+  saveSelectedQueues(DISPATCH_QUEUES);
+}
+
 renderQueueChoices();
 renderSortIndicators();
 setView(currentView);
-setInterval(loadRequests, 5000);
+
+// If live fetch is blocked by a corporate browser/network, full page reload still works.
+// This gives the board near-live updates using normal page navigation instead of XHR/fetch.
+setInterval(() => {
+  location.reload();
+}, 10000);
 </script>
 </body>
 </html>
