@@ -463,12 +463,13 @@ function startCustomFlow(flowKey) {
   const flow = CUSTOM_FLOWS.find(f => f.key === flowKey);
   if (!flow) return;
 
+  hidePanels();
+
   activeCustomFlow = flow;
   customFlowIndex = 0;
   customFlowPayload = {};
   customFlowHistory = [];
 
-  hidePanels();
   document.getElementById('requestCard').classList.add('hidden');
   document.getElementById('customFlowTitle').innerText = flow.label;
 
