@@ -27,8 +27,6 @@ RENDER_DB = "/var/data/driver_portal.sqlite3"
 
 
 def default_database_path():
-    if os.environ.get("RENDER"):
-        return RENDER_DB
     return LOCAL_DB
 
 app = Flask(__name__)
@@ -182,7 +180,7 @@ def get_db():
     db_path = app.config["DATABASE_PATH"]
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     if (
-        os.environ.get("RENDER")
+        os.environ.get("DATABASE_PATH")
         and db_path != LOCAL_DB
         and not os.path.exists(db_path)
         and os.path.exists(LOCAL_DB)
