@@ -221,6 +221,7 @@ def migrate_db(db):
     ensure_column(db, "request_types", "form_schema", "TEXT")
     ensure_column(db, "request_types", "button_color", "TEXT DEFAULT '#2563eb'")
     ensure_column(db, "driver_requests", "details_json", "TEXT")
+    ensure_column(db, "driver_requests", "supply_number", "TEXT")
     ensure_column(db, "request_comments", "visible_to_driver", "INTEGER NOT NULL DEFAULT 1")
 
 
@@ -272,6 +273,7 @@ def init_db():
                 dispatcher_group_name TEXT,
                 request_type_id INTEGER REFERENCES request_types(id) ON DELETE SET NULL,
                 request_type_label TEXT NOT NULL,
+                supply_number TEXT,
                 note TEXT,
                 details_json TEXT,
                 status TEXT NOT NULL CHECK(status IN ('new', 'acknowledged', 'done')),
@@ -684,7 +686,25 @@ def collect_request_details(schema):
     return details, errors
 
 
-def request_details_for_display(details_json, schema=None):
+def supply_number_from_details(details):
+    return (details.get("supply_number") or "").strip()
+
+
+def normalize_display_label(value):
+    return "".join(char.lower() for char in str(value or "") if char.isalnum())
+
+
+def fallback_detail_label(key):
+    if key.endswith("_volume"):
+        return "Volume"
+    if key.endswith("_action"):
+        return "Action"
+    if key.endswith("_number"):
+        return "Number"
+    return key.replace("_", " ").title()
+
+
+def request_details_for_display(details_json, schema=None, request_label=""):
     if not details_json:
         return []
     try:
@@ -697,18 +717,26 @@ def request_details_for_display(details_json, schema=None):
         for field in schema.get("fields", []):
             labels[field.get("name")] = field.get("label", field.get("name"))
 
-    return [
-        {"label": labels.get(key, key.replace("_", " ").title()), "value": value}
-        for key, value in details.items()
-        if value
-    ]
+    display_details = []
+    normalized_request_label = normalize_display_label(request_label)
+    for key, value in details.items():
+        if not value or key == "supply_number":
+            continue
+        label = labels.get(key, key.replace("_", " ").title())
+        if normalize_display_label(label) == normalized_request_label:
+            label = fallback_detail_label(key)
+        if normalize_display_label(label) == normalized_request_label:
+            label = ""
+        display_details.append({"label": label, "value": value})
+    return display_details
 
 
 def details_summary(details):
     if not details:
         return ""
-    return "Message: " + "; ".join(
-        f"{detail['label']}: {detail['value']}" for detail in details
+    return "; ".join(
+        f"{detail['label']}: {detail['value']}" if detail["label"] else str(detail["value"])
+        for detail in details
     )
 
 
@@ -721,9 +749,14 @@ def enrich_request_item(row):
     schema = parse_form_schema(type_row["form_schema"]) if type_row else {"fields": []}
     receipt_mode = receipt_mode_for_schema(schema)
     driver_label, driver_class = driver_status_for(item["status"], receipt_mode)
-    details = request_details_for_display(item["details_json"], schema)
+    details = request_details_for_display(item["details_json"], schema, item["request_type_label"])
     item["details"] = details
     item["details_summary"] = details_summary(details)
+    if not item.get("supply_number") and item.get("details_json"):
+        try:
+            item["supply_number"] = supply_number_from_details(json.loads(item["details_json"]))
+        except json.JSONDecodeError:
+            item["supply_number"] = ""
     item["receipt_mode"] = receipt_mode
     item["driver_status_label"] = driver_label
     item["driver_status_class"] = driver_class
@@ -1407,7 +1440,7 @@ def driver_home():
         <h2>Send Dispatch a request</h2>
         <form id="request-form" method="post" action="{{ url_for('create_driver_request') }}">
           <input id="request_type_id" name="request_type_id" type="hidden" required>
-          <div class="request-buttons">
+          <div id="request-buttons" class="request-buttons">
             {% for item in request_types %}
               <button class="btn request-choice" data-request-id="{{ item.id }}" style="background: {{ item.button_color }};" type="button">{{ item.label }}</button>
             {% endfor %}
@@ -1459,10 +1492,11 @@ def driver_home():
       }
       function renderDetails(details) {
         if (!details || !details.length) return "";
-        return `<div class="meta" style="margin-top: 8px;">${details.map((detail) => `<strong>${escapeHtml(detail.label)}:</strong> ${escapeHtml(detail.value)}`).join("<br>")}</div>`;
+        return `<div class="meta" style="margin-top: 8px;">${details.map((detail) => detail.label ? `<strong>${escapeHtml(detail.label)}:</strong> ${escapeHtml(detail.value)}` : escapeHtml(detail.value)).join("<br>")}</div>`;
       }
       const requestTypes = {{ request_types_json|tojson }};
       const requestInput = document.getElementById("request_type_id");
+      const requestButtons = document.getElementById("request-buttons");
       const detailPanel = document.getElementById("request-detail-panel");
       const dynamicFields = document.getElementById("dynamic-fields");
       const note = document.getElementById("note");
@@ -1478,6 +1512,7 @@ def driver_home():
         dynamicFields.innerHTML = "";
         note.value = "";
         note.required = false;
+        requestButtons.style.display = "grid";
         detailPanel.style.display = "none";
         sendButton.disabled = true;
         document.querySelectorAll(".request-choice").forEach((button) => button.classList.remove("secondary"));
@@ -1496,6 +1531,7 @@ def driver_home():
         note.placeholder = schema.note_placeholder || "Add context if needed";
         note.required = Boolean(schema.note_required);
         note.value = "";
+        requestButtons.style.display = "none";
         detailPanel.style.display = "block";
         sendButton.disabled = false;
       }
@@ -1574,7 +1610,7 @@ app.jinja_loader = ChoiceLoader(
           {% if item.details %}
             <div class="meta" style="margin-top: 8px;">
               {% for detail in item.details %}
-                <strong>{{ detail.label }}:</strong> {{ detail.value }}{% if not loop.last %}<br>{% endif %}
+                {% if detail.label %}<strong>{{ detail.label }}:</strong> {% endif %}{{ detail.value }}{% if not loop.last %}<br>{% endif %}
               {% endfor %}
             </div>
           {% endif %}
@@ -1613,6 +1649,7 @@ def create_driver_request():
 
     schema = parse_form_schema(request_type["form_schema"])
     details, errors = collect_request_details(schema)
+    supply_number = supply_number_from_details(details)
     note = request.form.get("note", "").strip()
     if schema.get("note_required") and not note:
         errors.append(f"{schema.get('note_label', 'Message')} is required.")
@@ -1626,8 +1663,8 @@ def create_driver_request():
         INSERT INTO driver_requests
             (driver_user_id, driver_name, truck_number, depot_id, depot_name,
              dispatcher_group_name, request_type_id, request_type_label,
-             note, details_json, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
+             supply_number, note, details_json, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
         """,
         (
             current_user()["id"],
@@ -1638,6 +1675,7 @@ def create_driver_request():
             profile.get("dispatcher_group_name"),
             request_type["id"],
             request_type["label"],
+            supply_number,
             note,
             json.dumps(details),
             now_iso(),
@@ -1698,9 +1736,9 @@ def dispatch_request_rows(filters):
         clauses.append(f"r.dispatcher_group_name IN ({placeholders})")
         params.extend(filters["group_names"])
     if filters.get("search"):
-        clauses.append("(r.driver_name LIKE ? OR r.truck_number LIKE ? OR r.note LIKE ?)")
+        clauses.append("(r.driver_name LIKE ? OR r.truck_number LIKE ? OR r.supply_number LIKE ? OR r.note LIKE ?)")
         term = f"%{filters['search']}%"
-        params.extend([term, term, term])
+        params.extend([term, term, term, term])
 
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     rows = query_all(
@@ -1814,6 +1852,7 @@ def dispatch_dashboard():
               <th>Depot</th>
               <th>Truck</th>
               <th>Driver</th>
+              <th>Supply No</th>
               <th>Request</th>
               <th>Details</th>
               <th>Notes</th>
@@ -1835,13 +1874,18 @@ def dispatch_dashboard():
                 <td>{{ item.depot_name }}</td>
                 <td>{{ item.truck_number }}</td>
                 <td>{{ item.driver_name }}</td>
+                <td><strong>{{ item.supply_number or '-' }}</strong></td>
                 <td><strong>{{ item.request_type_label }}</strong></td>
-                <td>{{ item.details_summary or item.note or '-' }}</td>
+                <td>{{ item.details_summary or '-' }}</td>
                 <td>
                   {% set comments = comments_by_request.get(item.id, []) %}
+                  {% if item.note %}
+                    <div><strong>Driver:</strong> {{ item.note }}</div>
+                  {% endif %}
                   {% if comments %}
-                    {{ comments[-1].body }}
-                  {% else %}
+                    <div><strong>Dispatch:</strong> {{ comments[-1].body }}</div>
+                  {% endif %}
+                  {% if not item.note and not comments %}
                     <span class="small">No notes</span>
                   {% endif %}
                 </td>
@@ -1861,7 +1905,7 @@ def dispatch_dashboard():
                 </td>
               </tr>
             {% else %}
-              <tr><td colspan="12">No requests match the current filters.</td></tr>
+              <tr><td colspan="13">No requests match the current filters.</td></tr>
             {% endfor %}
           </tbody>
         </table>

@@ -97,6 +97,7 @@ class DriverPortalSmokeTest(unittest.TestCase):
         )
         self.assertIn(b"choice-tile", driver_home.data)
         self.assertIn(b"request-back-button", driver_home.data)
+        self.assertIn(b'id="request-buttons"', driver_home.data)
         req_type = portal.query_one("SELECT id FROM request_types WHERE label = 'CIPs'")
         self.client.post(
             "/driver/request",
@@ -110,9 +111,39 @@ class DriverPortalSmokeTest(unittest.TestCase):
         request_row = portal.query_one("SELECT id, status, details_json FROM driver_requests")
         self.assertEqual(request_row["status"], "new")
         self.assertIn("Add CIP Start Of Day", request_row["details_json"])
+        milk_type = portal.query_one("SELECT id FROM request_types WHERE label = 'Milk Left Behind'")
+        self.client.post(
+            "/driver/request",
+            data={
+                "request_type_id": milk_type["id"],
+                "detail_supply_number": "SUP-12345",
+                "detail_milk_volume": "0-500L",
+                "detail_milk_stirred": "Yes",
+                "note": "Gate code is 1234",
+            },
+            follow_redirects=True,
+        )
+        milk_request = portal.query_one(
+            """
+            SELECT id, supply_number, details_json, note
+            FROM driver_requests
+            WHERE request_type_label = 'Milk Left Behind'
+            """
+        )
+        self.assertEqual(milk_request["supply_number"], "SUP-12345")
+        self.assertEqual(milk_request["note"], "Gate code is 1234")
         self.client.get("/logout")
 
         self.login("dispatch1", "pass123")
+        dispatch_page = self.client.get("/dispatch")
+        dispatch_html = dispatch_page.data.decode()
+        self.assertIn("<th>Supply No</th>", dispatch_html)
+        self.assertIn("<strong>SUP-12345</strong>", dispatch_html)
+        self.assertIn("<strong>Driver:</strong> Gate code is 1234", dispatch_html)
+        self.assertIn("Volume: 0-500L", dispatch_html)
+        self.assertNotIn("Supply number: SUP-12345", dispatch_html)
+        self.assertNotIn("Milk left behind: 0-500L", dispatch_html)
+        self.assertNotIn("Message: Milk left behind", dispatch_html)
         group = portal.query_one("SELECT id, name FROM dispatcher_groups WHERE name = 'Te Rapa'")
         self.client.post(
             f"/dispatch/request/{request_row['id']}/note",
