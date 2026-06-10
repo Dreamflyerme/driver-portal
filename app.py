@@ -222,6 +222,7 @@ def migrate_db(db):
     ensure_column(db, "request_types", "button_color", "TEXT DEFAULT '#2563eb'")
     ensure_column(db, "driver_requests", "details_json", "TEXT")
     ensure_column(db, "driver_requests", "supply_number", "TEXT")
+    ensure_column(db, "driver_requests", "driver_hidden_at", "TEXT")
     ensure_column(db, "request_comments", "visible_to_driver", "INTEGER NOT NULL DEFAULT 1")
 
 
@@ -280,6 +281,7 @@ def init_db():
                 created_at TEXT NOT NULL,
                 acknowledged_at TEXT,
                 completed_at TEXT
+                driver_hidden_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS request_comments (
@@ -740,6 +742,14 @@ def details_summary(details):
     )
 
 
+def driver_request_bucket(item):
+    if item["status"] == "done":
+        return "history"
+    if item["receipt_mode"] == "ack_only" and item["status"] == "acknowledged":
+        return "history"
+    return "active"
+
+
 def enrich_request_item(row):
     item = dict(row)
     type_row = query_one(
@@ -768,6 +778,7 @@ def enrich_request_item(row):
     }.get(item["status"], "row-new")
     item["can_acknowledge"] = item["status"] == "new" and receipt_mode != "none"
     item["can_complete"] = item["status"] in {"new", "acknowledged"}
+    item["driver_bucket"] = driver_request_bucket(item)
     return item
 
 
@@ -1426,7 +1437,7 @@ def driver_home():
     redirect_response = require_shift_profile()
     if redirect_response:
         return redirect_response
-    requests = driver_request_rows(current_user()["id"])
+    driver_lists = driver_request_lists(current_user()["id"])
     body = """
     <section class="hero">
       <div>
@@ -1463,8 +1474,18 @@ def driver_home():
           <span class="small" id="last-updated">Live</span>
         </div>
         <div id="driver-requests" class="list">
-          {% include 'driver_request_items' %}
+          {% with requests=active_requests %}
+            {% include 'driver_request_active_items' %}
+          {% endwith %}
         </div>
+        <details style="margin-top: 14px;">
+          <summary style="cursor: pointer; font-weight: 900;">Old requests</summary>
+          <div id="driver-request-history" class="list" style="margin-top: 10px;">
+            {% with requests=history_requests %}
+              {% include 'driver_request_history_items' %}
+            {% endwith %}
+          </div>
+        </details>
       </section>
     </div>
     <script>
@@ -1473,7 +1494,14 @@ def driver_home():
         if (!response.ok) return;
         const data = await response.json();
         const wrap = document.getElementById("driver-requests");
-        wrap.innerHTML = data.requests.map((item) => `
+        const historyWrap = document.getElementById("driver-request-history");
+        wrap.innerHTML = renderActiveRequests(data.active_requests);
+        historyWrap.innerHTML = renderHistoryRequests(data.history_requests);
+        bindDismissGestures();
+        document.getElementById("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
+      }
+      function renderActiveRequests(requests) {
+        return requests.map((item) => `
           <article class="item">
             <div class="item-head">
               <strong>${escapeHtml(item.request_type_label)}</strong>
@@ -1483,9 +1511,32 @@ def driver_home():
             ${renderDetails(item.details)}
             ${item.note ? `<p style="margin-top: 8px;">${escapeHtml(item.note)}</p>` : ""}
             ${item.comments.map((comment) => `<div class="comment"><strong>${escapeHtml(comment.author_name)}</strong><div>${escapeHtml(comment.body)}</div><div class="meta">${escapeHtml(comment.created_at)}</div></div>`).join("")}
+            <form method="post" action="/driver/request/${item.id}/dismiss" style="margin-top: 8px;">
+              <button class="btn ghost" type="submit">Dismiss</button>
+            </form>
           </article>
-        `).join("") || `<div class="item"><p>No requests yet.</p></div>`;
-        document.getElementById("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
+        `).join("") || `<div class="item"><p>No active requests.</p></div>`;
+      }
+      function renderHistoryRequests(requests) {
+        return requests.map((item) => `
+          <details class="item driver-dismissible">
+            <summary style="cursor: pointer;">
+              <div class="item-head" style="display: inline-flex; width: calc(100% - 20px);">
+                <strong>${escapeHtml(item.request_type_label)}</strong>
+              </div>
+              <div class="meta">${escapeHtml(item.created_at)} · ${escapeHtml(item.depot_name)} · Truck ${escapeHtml(item.truck_number)}</div>
+            </summary>
+            <div style="margin-top: 8px;">
+              ${item.supply_number ? `<div class="meta"><strong>Supply No:</strong> ${escapeHtml(item.supply_number)}</div>` : ""}
+              ${renderDetails(item.details)}
+              ${item.note ? `<p style="margin-top: 8px;">${escapeHtml(item.note)}</p>` : ""}
+              ${item.comments.map((comment) => `<div class="comment"><strong>${escapeHtml(comment.author_name)}</strong><div>${escapeHtml(comment.body)}</div><div class="meta">${escapeHtml(comment.created_at)}</div></div>`).join("")}
+              <form method="post" action="/driver/request/${item.id}/dismiss" style="margin-top: 8px;">
+                <button class="btn ghost" type="submit">Dismiss</button>
+              </form>
+            </div>
+          </details>
+        `).join("") || `<div class="item"><p>No old requests.</p></div>`;
       }
       function escapeHtml(value) {
         return String(value || "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char]));
@@ -1581,6 +1632,22 @@ def driver_home():
           });
         });
       }
+      function bindDismissGestures() {
+        document.querySelectorAll(".driver-dismissible").forEach((item) => {
+          let startX = 0;
+          item.addEventListener("touchstart", (event) => {
+            startX = event.touches[0].clientX;
+          }, { passive: true });
+          item.addEventListener("touchend", (event) => {
+            const endX = event.changedTouches[0].clientX;
+            if (startX - endX > 90) {
+              const form = item.querySelector("form");
+              if (form) form.requestSubmit();
+            }
+          });
+        });
+      }
+      bindDismissGestures();
       setInterval(refreshDriverRequests, 5000);
     </script>
     """
@@ -1590,7 +1657,8 @@ def driver_home():
         profile=session["shift_profile"],
         request_types=request_type_cards(),
         request_types_json=request_type_cards(),
-        requests=requests,
+        active_requests=driver_lists["active_requests"],
+        history_requests=driver_lists["history_requests"],
     )
 
 
@@ -1599,7 +1667,7 @@ app.jinja_loader = ChoiceLoader(
         app.jinja_loader,
         DictLoader(
             {
-                "driver_request_items": """
+                "driver_request_active_items": """
       {% for item in requests %}
         <article class="item">
           <div class="item-head">
@@ -1622,9 +1690,49 @@ app.jinja_loader = ChoiceLoader(
               <div class="meta">{{ comment.created_at }}</div>
             </div>
           {% endfor %}
+          <form method="post" action="{{ url_for('dismiss_driver_request', request_id=item.id) }}" style="margin-top: 8px;">
+            <button class="btn ghost" type="submit">Dismiss</button>
+          </form>
         </article>
       {% else %}
-        <div class="item"><p>No requests yet.</p></div>
+        <div class="item"><p>No active requests.</p></div>
+      {% endfor %}
+    """,
+                "driver_request_history_items": """
+      {% for item in requests %}
+        <details class="item driver-dismissible">
+          <summary style="cursor: pointer;">
+            <div class="item-head" style="display: inline-flex; width: calc(100% - 20px);">
+              <strong>{{ item.request_type_label }}</strong>
+            </div>
+            <div class="meta">{{ item.created_at }} · {{ item.depot_name }} · Truck {{ item.truck_number }}</div>
+          </summary>
+          <div style="margin-top: 8px;">
+            {% if item.supply_number %}
+              <div class="meta"><strong>Supply No:</strong> {{ item.supply_number }}</div>
+            {% endif %}
+            {% if item.details %}
+              <div class="meta" style="margin-top: 8px;">
+                {% for detail in item.details %}
+                  {% if detail.label %}<strong>{{ detail.label }}:</strong> {% endif %}{{ detail.value }}{% if not loop.last %}<br>{% endif %}
+                {% endfor %}
+              </div>
+            {% endif %}
+            {% if item.note %}<p style="margin-top: 8px;">{{ item.note }}</p>{% endif %}
+            {% for comment in item.comments %}
+              <div class="comment">
+                <strong>{{ comment.author_name }}</strong>
+                <div>{{ comment.body }}</div>
+                <div class="meta">{{ comment.created_at }}</div>
+              </div>
+            {% endfor %}
+            <form method="post" action="{{ url_for('dismiss_driver_request', request_id=item.id) }}" style="margin-top: 8px;">
+              <button class="btn ghost" type="submit">Dismiss</button>
+            </form>
+          </div>
+        </details>
+      {% else %}
+        <div class="item"><p>No old requests.</p></div>
       {% endfor %}
     """
             }
@@ -1685,12 +1793,12 @@ def create_driver_request():
     return redirect(url_for("driver_home"))
 
 
-def driver_request_rows(user_id):
+def load_driver_request_rows(user_id):
     rows = query_all(
         """
         SELECT *
         FROM driver_requests
-        WHERE driver_user_id = ?
+        WHERE driver_user_id = ? AND driver_hidden_at IS NULL
         ORDER BY
           CASE status WHEN 'new' THEN 1 WHEN 'acknowledged' THEN 2 ELSE 3 END,
           created_at DESC
@@ -1716,10 +1824,45 @@ def driver_request_rows(user_id):
     return requests
 
 
+def driver_request_lists(user_id):
+    requests = load_driver_request_rows(user_id)
+    return {
+        "active_requests": [item for item in requests if item["driver_bucket"] == "active"],
+        "history_requests": [item for item in requests if item["driver_bucket"] == "history"],
+    }
+
+
+def driver_request_rows(user_id):
+    lists = driver_request_lists(user_id)
+    return lists["active_requests"] + lists["history_requests"]
+
+
 @app.route("/api/driver/requests")
 @roles_required("driver")
 def driver_requests_api():
-    return jsonify({"requests": driver_request_rows(current_user()["id"])})
+    lists = driver_request_lists(current_user()["id"])
+    return jsonify({
+        "requests": lists["active_requests"] + lists["history_requests"],
+        "active_requests": lists["active_requests"],
+        "history_requests": lists["history_requests"],
+    })
+
+
+@app.route("/driver/request/<int:request_id>/dismiss", methods=["POST"])
+@roles_required("driver")
+def dismiss_driver_request(request_id):
+    item = query_one(
+        "SELECT id FROM driver_requests WHERE id = ? AND driver_user_id = ?",
+        (request_id, current_user()["id"]),
+    )
+    if not item:
+        abort(404)
+    execute(
+        "UPDATE driver_requests SET driver_hidden_at = ? WHERE id = ?",
+        (now_iso(), request_id),
+    )
+    flash("Request dismissed from your view.")
+    return redirect(url_for("driver_home"))
 
 
 def dispatch_request_rows(filters):

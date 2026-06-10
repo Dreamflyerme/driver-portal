@@ -189,6 +189,44 @@ class DriverPortalSmokeTest(unittest.TestCase):
         )
         completed = portal.query_one("SELECT status FROM driver_requests WHERE id = ?", (request_row["id"],))
         self.assertEqual(completed["status"], "done")
+        self.client.get("/logout")
+
+        self.login("driver1", "pass123")
+        self.client.post(
+            "/driver/profile",
+            data={
+                "driver_name": "Driver One",
+                "truck_number": "T42",
+                "depot_id": depot["id"],
+            },
+            follow_redirects=True,
+        )
+        history_page = self.client.get("/driver")
+        history_html = history_page.data.decode()
+        self.assertIn("Old requests", history_html)
+        self.assertIn("driver-request-history", history_html)
+        self.assertIn("Add CIP Start Of Day", history_html)
+        history_section = history_html.split('id="driver-request-history"', 1)[1]
+        self.assertNotIn(">Done</span>", history_section)
+        self.assertNotIn(">Sent</span>", history_section)
+        self.client.post(
+            f"/driver/request/{request_row['id']}/dismiss",
+            follow_redirects=True,
+        )
+        hidden = portal.query_one(
+            "SELECT driver_hidden_at FROM driver_requests WHERE id = ?",
+            (request_row["id"],),
+        )
+        self.assertIsNotNone(hidden["driver_hidden_at"])
+        driver_api = self.client.get("/api/driver/requests").get_json()
+        visible_ids = [
+            item["id"]
+            for item in driver_api["active_requests"] + driver_api["history_requests"]
+        ]
+        self.assertNotIn(request_row["id"], visible_ids)
+        self.client.get("/logout")
+
+        self.login("dispatch1", "pass123")
         self.client.post(
             "/dispatch/requests/delete-done",
             data={"request_id": str(request_row["id"])},
