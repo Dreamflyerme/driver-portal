@@ -48,7 +48,9 @@ Demo/testing logins:
 
 Local development uses SQLite at `data/driver_portal.sqlite3`.
 
-On Render, the app can use SQLite at `/var/data/driver_portal.sqlite3` when `DATABASE_PATH` is set to that value. That path must be backed by a Render persistent disk, otherwise the app should use the committed showcase database at `data/driver_portal.sqlite3` until the disk is configured.
+For the free Render showcase deploy, `data/driver_portal.sqlite3` is intentionally included in Git as the starter database. The app will boot from that committed database on Render.
+
+Render free services do not include persistent disks. Any changes written by the deployed app can be lost when Render restarts or redeploys the service. The committed starter database will still provide the showcase setup each time the app deploys.
 
 ## Render deployment
 
@@ -57,18 +59,15 @@ Render settings for this app:
 - Build command: `pip install -r requirements.txt`
 - Start command: `gunicorn app:app`
 - Environment variable: set `SECRET_KEY` to a long random value.
-- Persistent disk mount path: `/var/data`
-- Database path: `/var/data/driver_portal.sqlite3`
 
-The included `render.yaml` defines the web service, a persistent disk, and the `DATABASE_PATH` setting. If you replace an existing Render service instead of creating from the Blueprint, manually add a persistent disk mounted at `/var/data` and set `DATABASE_PATH=/var/data/driver_portal.sqlite3`.
+The included `render.yaml` defines a free-tier-compatible web service. It does not attach a disk.
 
-For this showcase build, `data/driver_portal.sqlite3` is intentionally allowed in Git as the starter database. On first Render boot, if `/var/data/driver_portal.sqlite3` does not exist yet, the app copies the committed starter database to the persistent disk. After that, Render keeps using the persistent disk database and later deploys do not overwrite it.
+For durable production-style data on Render, upgrade to a service that supports persistent disks and set `DATABASE_PATH=/var/data/driver_portal.sqlite3`, or move the app to an external Postgres provider.
 
 If Render shows a 500 error immediately after deploy, check the service environment:
 
-- If `DATABASE_PATH=/var/data/driver_portal.sqlite3` is set, the service also needs a persistent disk mounted at `/var/data`.
-- If the disk is not attached yet, temporarily remove the `DATABASE_PATH` environment variable and redeploy. The app will boot from `data/driver_portal.sqlite3`.
-- Once the service is working, add the persistent disk at `/var/data`, set `DATABASE_PATH=/var/data/driver_portal.sqlite3`, and redeploy.
+- On the free Render plan, remove any `DATABASE_PATH=/var/data/driver_portal.sqlite3` environment variable.
+- Redeploy so the app uses the committed showcase database at `data/driver_portal.sqlite3`.
 
 Do not upload `.venv`, `__pycache__`, `.env`, or extra local database backups.
 

@@ -23,7 +23,6 @@ from jinja2 import ChoiceLoader, DictLoader
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 LOCAL_DB = os.path.join(APP_ROOT, "data", "driver_portal.sqlite3")
-RENDER_DB = "/var/data/driver_portal.sqlite3"
 
 
 def default_database_path():

@@ -7,9 +7,3 @@ services:
     envVars:
       - key: SECRET_KEY
         sync: false
-      - key: DATABASE_PATH
-        value: /var/data/driver_portal.sqlite3
-    disk:
-      name: driver-portal-data
-      mountPath: /var/data
-      sizeGB: 5
