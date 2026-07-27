@@ -3,7 +3,8 @@ import json
 import shutil
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from functools import wraps
 
 from flask import (
@@ -31,6 +32,7 @@ def default_database_path():
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me-before-production")
 app.config["DATABASE_PATH"] = os.environ.get("DATABASE_PATH", default_database_path())
+app.config["PORTAL_TIMEZONE"] = os.environ.get("PORTAL_TIMEZONE", "Pacific/Auckland")
 
 
 LEGACY_REQUEST_LABELS = [
@@ -175,6 +177,23 @@ def now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def portal_timezone():
+    try:
+        return ZoneInfo(app.config.get("PORTAL_TIMEZONE", "Pacific/Auckland"))
+    except Exception:
+        return timezone.utc
+
+
+def format_local_datetime(value):
+    """Convert stored UTC/ISO timestamps to the portal's local display time."""
+    parsed = parse_iso(value)
+    if not parsed:
+        return value or ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(portal_timezone()).strftime("%d/%m/%Y %H:%M")
+
+
 def get_db():
     db_path = app.config["DATABASE_PATH"]
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -222,6 +241,7 @@ def migrate_db(db):
     ensure_column(db, "request_types", "button_color", "TEXT DEFAULT '#2563eb'")
     ensure_column(db, "driver_requests", "details_json", "TEXT")
     ensure_column(db, "driver_requests", "supply_number", "TEXT")
+    ensure_column(db, "driver_requests", "driver_hidden", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(db, "request_comments", "visible_to_driver", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(db, "users", "access_role", "TEXT")
     ensure_column(db, "users", "driver_number", "TEXT")
@@ -633,7 +653,10 @@ def parse_iso(value):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
     except ValueError:
         return None
 
@@ -759,6 +782,12 @@ def enrich_request_item(row):
     item["driver_status_label"] = driver_label
     item["driver_status_class"] = driver_class
     item["age"] = format_age(item["created_at"])
+    item["created_at_raw"] = item["created_at"]
+    item["created_at"] = format_local_datetime(item["created_at_raw"])
+    if item.get("acknowledged_at"):
+        item["acknowledged_at"] = format_local_datetime(item["acknowledged_at"])
+    if item.get("completed_at"):
+        item["completed_at"] = format_local_datetime(item["completed_at"])
     item["row_class"] = {
         "new": "row-new",
         "acknowledged": "row-acknowledged",
@@ -1902,17 +1931,38 @@ def driver_home():
       }
       async function refreshDriverRequests() {
         try {
-          const response = await fetch("{{ url_for('driver_requests_api') }}", { headers: { "Accept": "application/json" } });
+          const response = await fetch("{{ url_for('driver_requests_api') }}", {
+            headers: { "Accept": "application/json" },
+            cache: "no-store"
+          });
           if (!response.ok) return;
           const data = await response.json();
+          if (!data.ok || !Array.isArray(data.requests)) return;
           document.getElementById("driver-requests").innerHTML = data.requests.map((item) => `
-            <article class="item"><div class="item-head"><strong>${escapeHtml(item.request_type_label)}</strong><span class="status ${item.driver_status_class}">${escapeHtml(item.driver_status_label)}</span></div>
+            <article class="item"><div class="item-head"><strong>${escapeHtml(item.request_type_label)}</strong><div class="inline" style="gap:8px;"><span class="status ${item.driver_status_class}">${escapeHtml(item.driver_status_label)}</span><button class="btn ghost compact driver-delete-request" type="button" data-request-id="${item.id}" aria-label="Delete request from Recent Notes">Delete</button></div></div>
             <div class="meta">${escapeHtml(item.created_at)} · ${escapeHtml(item.depot_name)} · Truck ${escapeHtml(item.truck_number)}</div>${renderDetails(item.details)}
             ${item.note ? `<p style="margin-top:8px;">${escapeHtml(item.note)}</p>` : ""}
             ${item.comments.map((comment) => `<div class="comment"><strong>${escapeHtml(comment.author_name)}</strong><div>${escapeHtml(comment.body)}</div><div class="meta">${escapeHtml(comment.created_at)}</div></div>`).join("")}</article>`).join("") || `<div class="item"><p>No requests yet.</p></div>`;
           document.getElementById("last-updated").textContent = "Updated " + new Date().toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
         } catch (_) {}
       }
+      async function deleteDriverRequest(requestId) {
+        if (!confirm("Remove this request from Recent Notes?")) return;
+        try {
+          const response = await fetch(`/driver/request/${requestId}/delete`, {
+            method: "POST",
+            headers: {"X-Requested-With": "fetch", "Accept": "application/json"}
+          });
+          if (!response.ok) throw new Error("delete failed");
+          await refreshDriverRequests();
+        } catch (_) {
+          alert("Could not remove the request. Please try again.");
+        }
+      }
+      document.getElementById("driver-requests").addEventListener("click", (event) => {
+        const button = event.target.closest(".driver-delete-request");
+        if (button) deleteDriverRequest(button.dataset.requestId);
+      });
 
       const requestTypes = {{ request_types_json|tojson }};
       const form = document.getElementById("request-form");
@@ -2025,8 +2075,16 @@ def driver_home():
         const payload = new FormData(); payload.set("request_type_id", selectedType.id); payload.set("note", reviewNote.value.trim());
         visibleFields.forEach((field) => payload.set(`detail_${field.name}`, answers[field.name] || ""));
         try {
-          const response = await fetch(form.action, { method: "POST", body: payload, headers: {"X-Requested-With":"fetch"} });
-          if (!response.ok) throw new Error("send failed");
+          const response = await fetch(form.action, {
+            method: "POST",
+            body: payload,
+            headers: {"X-Requested-With":"fetch", "Accept":"application/json"},
+            redirect: "error"
+          });
+          const contentType = response.headers.get("content-type") || "";
+          if (!response.ok || !contentType.includes("application/json")) throw new Error("send failed");
+          const result = await response.json();
+          if (!result.ok) throw new Error(result.error || "send failed");
           flowPanel.hidden = true; sendState.hidden = false;
           let seconds = 5;
           sendState.innerHTML = `<div class="success-mark">✓</div><h2>Sent to Dispatch</h2><p>${escapeHtml(selectedType.label)}</p><button class="btn full" type="button" id="send-another">Main Menu (${seconds})</button>`;
@@ -2062,7 +2120,10 @@ app.jinja_loader = ChoiceLoader(
         <article class="item">
           <div class="item-head">
             <strong>{{ item.request_type_label }}</strong>
-            <span class="status {{ item.driver_status_class }}">{{ item.driver_status_label }}</span>
+            <div class="inline" style="gap:8px;">
+              <span class="status {{ item.driver_status_class }}">{{ item.driver_status_label }}</span>
+              <button class="btn ghost compact driver-delete-request" type="button" data-request-id="{{ item.id }}" aria-label="Delete request from Recent Notes">Delete</button>
+            </div>
           </div>
           <div class="meta">{{ item.created_at }} · {{ item.depot_name }} · Truck {{ item.truck_number }}</div>
           {% if item.details %}
@@ -2116,7 +2177,7 @@ def create_driver_request():
         return redirect(url_for("driver_home"))
 
     profile = session["shift_profile"]
-    execute(
+    request_id = execute(
         """
         INSERT INTO driver_requests
             (driver_user_id, driver_name, truck_number, depot_id, depot_name,
@@ -2139,16 +2200,39 @@ def create_driver_request():
             now_iso(),
         ),
     )
+
+    # The driver page submits with fetch(). Returning a redirect made the browser
+    # follow it and treat any problem rendering the destination page as a failed
+    # send, even though the database insert had already succeeded. Return a clear
+    # JSON acknowledgement for fetch submissions so the UI and stored request stay
+    # in sync.
+    if request.headers.get("X-Requested-With") == "fetch":
+        created = next(
+            (item for item in driver_request_rows(current_user()["id"]) if item["id"] == request_id),
+            None,
+        )
+        response = jsonify({"ok": True, "request": created})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 201
+
     flash("Request sent to Dispatch.")
     return redirect(url_for("driver_home"))
 
 
 def driver_request_rows(user_id):
+    # Recent Notes is a short-lived driver inbox. Items older than 24 hours are
+    # automatically removed from the driver's view, while Dispatch retains its
+    # operational record and comments.
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    execute(
+        "UPDATE driver_requests SET driver_hidden = 1 WHERE driver_user_id = ? AND created_at < ?",
+        (user_id, cutoff),
+    )
     rows = query_all(
         """
         SELECT *
         FROM driver_requests
-        WHERE driver_user_id = ?
+        WHERE driver_user_id = ? AND COALESCE(driver_hidden, 0) = 0
         ORDER BY
           CASE status WHEN 'new' THEN 1 WHEN 'acknowledged' THEN 2 ELSE 3 END,
           created_at DESC
@@ -2170,14 +2254,36 @@ def driver_request_rows(user_id):
                 (row["id"],),
             )
         ) if item["receipt_mode"] != "none" else []
+        for comment in item["comments"]:
+            comment["created_at"] = format_local_datetime(comment["created_at"])
         requests.append(item)
     return requests
+
+
+@app.route("/driver/request/<int:request_id>/delete", methods=["POST"])
+@roles_required("driver")
+def hide_driver_request(request_id):
+    item = query_one(
+        "SELECT id FROM driver_requests WHERE id = ? AND driver_user_id = ?",
+        (request_id, current_user()["id"]),
+    )
+    if not item:
+        abort(404)
+    execute("UPDATE driver_requests SET driver_hidden = 1 WHERE id = ?", (request_id,))
+    if request.headers.get("X-Requested-With") == "fetch":
+        response = jsonify({"ok": True})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    flash("Request removed from Recent Notes.")
+    return redirect(url_for("driver_home"))
 
 
 @app.route("/api/driver/requests")
 @roles_required("driver")
 def driver_requests_api():
-    return jsonify({"requests": driver_request_rows(current_user()["id"])})
+    response = jsonify({"ok": True, "requests": driver_request_rows(current_user()["id"])})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def dispatch_request_rows(filters):
@@ -3418,8 +3524,27 @@ def admin_toggle_user(user_id):
     if user_id == current_user()["id"]:
         flash("You cannot disable your own account while logged in.")
     else:
-        execute("UPDATE users SET active = CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id = ?", (user_id,))
-        flash("User status updated.")
+        target = query_one(
+            "SELECT active, COALESCE(access_role, role) AS effective_role FROM users WHERE id = ?",
+            (user_id,),
+        )
+        if not target:
+            abort(404)
+        new_active = 0 if target["active"] else 1
+        if new_active and target["effective_role"] == "driver":
+            execute(
+                """
+                UPDATE users
+                SET active = 1, access_status = 'approved',
+                    reviewed_at = ?, reviewed_by = ?
+                WHERE id = ?
+                """,
+                (now_iso(), current_user()["id"], user_id),
+            )
+            flash("Driver activated and approved.")
+        else:
+            execute("UPDATE users SET active = ? WHERE id = ?", (new_active, user_id))
+            flash("User status updated.")
     return redirect(url_for("admin_dashboard"))
 
 

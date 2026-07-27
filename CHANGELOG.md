@@ -102,3 +102,26 @@
 - Removed the global "Standard Default" desk-profile concept.
 - Corrected pending approval summaries to count only inactive pending accounts.
 - Preserved page scroll position after form saves and improved dispatch filter wording.
+
+## Hotfix - Driver request submission and status tracking
+
+- Fixed driver requests displaying “Could not send” after the request had already reached Dispatch.
+- Driver fetch submissions now receive an explicit JSON success response instead of following a page redirect.
+- Restored the success screen and automatic return to the main request menu.
+- Added no-cache responses for the driver's live request history/status feed.
+- Added response validation so HTML redirects or server errors cannot be mistaken for successful API responses.
+- Driver request history now refreshes immediately after sending and continues polling for acknowledgement/completion changes.
+
+## Driver approval hotfix
+
+- Fixed Admin **Make active** leaving a driver in `pending` approval state.
+- Activating a driver from Admin now also records the account as approved.
+- Records the reviewing Admin and review time when activation grants approval.
+
+## Driver Recent Notes hotfix
+
+- Converted driver-visible request and comment timestamps from UTC to configurable local time.
+- Standardised displayed dates as `dd/mm/yyyy HH:mm`.
+- Added driver-controlled removal of requests from Recent Notes.
+- Automatically hides Recent Notes items after 24 hours.
+- Preserves Dispatch records when a driver removes or ages out an item.
