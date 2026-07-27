@@ -90,3 +90,15 @@
 - Added depot-level pending approval totals and quick links.
 - Added an Admin pending-approvals summary showing counts by depot.
 - Pending counts also appear beside the relevant driver depot group and depot routing row.
+
+## 2026-07 consolidated bench build
+- Added Fonterra branding to login and navigation.
+- Added clearer inactive, pending and rejected login messages plus forgot-password guidance.
+- Added forced password change after Admin/Depot temporary password resets.
+- Added remembered driver shift defaults.
+- Added numeric mobile keyboard and digit-only handling for supply numbers.
+- Added driver search for Admin and Depot users.
+- Added Admin controls for driver home depot and dispatcher default desk profile.
+- Removed the global "Standard Default" desk-profile concept.
+- Corrected pending approval summaries to count only inactive pending accounts.
+- Preserved page scroll position after form saves and improved dispatch filter wording.

@@ -229,6 +229,10 @@ def migrate_db(db):
     ensure_column(db, "users", "access_status", "TEXT NOT NULL DEFAULT 'approved'")
     ensure_column(db, "users", "reviewed_at", "TEXT")
     ensure_column(db, "users", "reviewed_by", "INTEGER")
+    ensure_column(db, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "users", "default_truck_number", "TEXT")
+    ensure_column(db, "users", "default_depot_id", "INTEGER REFERENCES depots(id) ON DELETE SET NULL")
+    ensure_column(db, "users", "default_desk_profile_id", "INTEGER REFERENCES desk_profiles(id) ON DELETE SET NULL")
 
 
 def init_db():
@@ -460,7 +464,7 @@ def seed_defaults():
             (
                 "Central South",
                 "Standard desk profile for Clandeboye and Darfield queues.",
-                1,
+                0,
                 20,
                 ["Clandeboye", "Darfield"],
             ),
@@ -507,7 +511,7 @@ def current_user():
     if not user_id:
         return None
     return query_one(
-        "SELECT id, username, display_name, COALESCE(access_role, role) AS role, active, driver_number, home_depot_id, access_status FROM users WHERE id = ?",
+        "SELECT id, username, display_name, COALESCE(access_role, role) AS role, active, driver_number, home_depot_id, access_status, must_change_password, default_truck_number, default_depot_id, default_desk_profile_id FROM users WHERE id = ?",
         (user_id,),
     )
 
@@ -519,6 +523,8 @@ def login_required(view):
         if not user or not user["active"]:
             session.clear()
             return redirect(url_for("login"))
+        if user["must_change_password"] and request.endpoint not in {"change_password", "logout", "static"}:
+            return redirect(url_for("change_password", required=1))
         return view(*args, **kwargs)
 
     return wrapped
@@ -1314,12 +1320,13 @@ BASE_TEMPLATE = """
       .driver-send-panel { padding:14px; }
       .admin-preview { position:static; }
     }
-  </style>
+  .brand{display:flex;align-items:center}.dispatch-tools form.inline{gap:8px}.compact-record[style*="display: none"]{display:none!important}
+</style>
 </head>
 <body>
   <header class="topbar">
     <div class="shell topbar-inner">
-      <div class="brand">Driver Dispatch Portal</div>
+      <div class="brand"><img src="{{ url_for('static', filename='fonterra-logo.png') }}" alt="Fonterra" style="height:34px;vertical-align:middle;margin-right:10px;">Transport Driver Portal</div>
       <nav class="nav">
         {% if user %}
           <span class="chip">{{ user.display_name }} · {{ user.role|title }}</span>
@@ -1339,6 +1346,27 @@ BASE_TEMPLATE = """
     {% endfor %}
     {{ body|safe }}
   </main>
+<script>
+(function(){
+  const key='portal-scroll:'+location.pathname;
+  const editKey='portal-edited-section:'+location.pathname;
+  const y=sessionStorage.getItem(key);
+  if(y){requestAnimationFrame(()=>scrollTo(0,Number(y)));sessionStorage.removeItem(key);}
+  const editedId=sessionStorage.getItem(editKey);
+  if(editedId){const edited=document.getElementById(editedId);if(edited&&edited.tagName==='DETAILS')edited.open=false;sessionStorage.removeItem(editKey);}
+  document.querySelectorAll('form').forEach(form=>form.addEventListener('submit',()=>{
+    sessionStorage.setItem(key,String(scrollY));
+    const section=form.closest('details[id]'); if(section)sessionStorage.setItem(editKey,section.id);
+  }));
+  const bindSearch=(id)=>{const el=document.getElementById(id);if(!el)return;el.addEventListener('input',()=>{
+    const q=el.value.trim().toLowerCase(); let first=null;
+    document.querySelectorAll('[data-driver-search]').forEach(card=>{const match=!q||card.dataset.driverSearch.includes(q);card.style.display=match?'':'none';if(match&&q){card.open=true;card.closest('details.depot-people-group')?.setAttribute('open','');if(!first)first=card;}});
+    if(first)first.scrollIntoView({behavior:'smooth',block:'center'});
+  });};
+  bindSearch('admin-driver-search'); bindSearch('depot-driver-search');
+  document.querySelectorAll('input[data-numeric-only]').forEach(input=>input.addEventListener('input',()=>input.value=input.value.replace(/\\D/g,'')));
+})();
+</script>
 </body>
 </html>
 """
@@ -1373,41 +1401,38 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         user = query_one("SELECT * FROM users WHERE username = ?", (username,))
-        if user and check_password_hash(user["password_hash"], password) and not user["active"] and user["access_status"] == "pending":
-            flash("Your access request is waiting for depot approval.")
-        elif user and check_password_hash(user["password_hash"], password) and not user["active"] and user["access_status"] == "rejected":
-            flash("Your access request was not approved. Contact your depot team.")
-        elif not user or not user["active"] or not check_password_hash(user["password_hash"], password):
-            flash("Login failed. Check the username and password.")
+        valid_password = bool(user and check_password_hash(user["password_hash"], password))
+        if user and valid_password and user["access_status"] == "pending":
+            flash("Your account is awaiting approval from your transport depot.")
+        elif user and valid_password and user["access_status"] == "rejected":
+            flash("Your access request was not approved. Contact your transport depot for assistance.")
+        elif user and valid_password and not user["active"]:
+            flash("Your account is inactive or disabled. Contact your transport depot for assistance.")
+        elif not user:
+            flash("Login failed. Check the driver number or username and password.")
+        elif not valid_password:
+            flash("Incorrect password.")
         else:
             session.clear()
             session["user_id"] = user["id"]
             if user["role"] == "driver":
                 session.pop("shift_profile", None)
+            if user["must_change_password"]:
+                return redirect(url_for("change_password", required=1))
             return redirect(url_for("index"))
 
     body = """
-    <section class="hero">
-      <div>
-        <h1>Fast updates for quiet issues.</h1>
-        <p>Drivers can send non-urgent dispatch messages in a few taps.</p>
-      </div>
-    </section>
-    <section class="panel" style="max-width: 460px;">
-      <h2>Login</h2>
-      <form method="post">
-        <div class="field">
-          <label for="username">Username</label>
-          <input id="username" name="username" autocomplete="username" required autofocus>
-        </div>
-        <div class="field">
-          <label for="password">Password</label>
-          <input id="password" name="password" type="password" autocomplete="current-password" required>
-        </div>
+    <section class="panel" style="max-width:460px;margin:48px auto;text-align:center;">
+      <img src="{{ url_for('static', filename='fonterra-logo.png') }}" alt="Fonterra" style="max-width:300px;width:85%;margin:0 auto 18px;display:block;">
+      <h1>Transport Driver Portal</h1>
+      <p class="small">Non-urgent transport updates for Dispatch.</p>
+      <form method="post" style="text-align:left;">
+        <div class="field"><label for="username">Driver number or username</label><input id="username" name="username" autocomplete="username" required autofocus></div>
+        <div class="field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required></div>
         <button class="btn full" type="submit">Login</button>
       </form>
+      <details style="margin-top:12px;text-align:left;"><summary class="btn ghost full" style="list-style:none;text-align:center;">Forgot password?</summary><p class="small" style="margin-top:10px;">Contact your transport depot to have your password reset.</p></details>
       <a class="btn ghost full" style="margin-top:12px;" href="{{ url_for('request_access') }}">Request access</a>
-      <p class="small" style="margin-top: 14px;">First run admin: username <strong>admin</strong>, password <strong>admin123</strong>.</p>
     </section>
     """
     return render_page("Login", body)
@@ -1443,7 +1468,7 @@ def request_access():
       <h1>Request driver access</h1>
       <p>Your driver number will be your username. The depot team will review the request.</p>
       <form method="post">
-        <div class="field"><label>Driver number</label><input name="driver_number" inputmode="numeric" required autofocus></div>
+        <div class="field"><label>Driver number</label><input name="driver_number" type="text" inputmode="numeric" pattern="[0-9]*" required autofocus></div>
         <div class="field"><label>Your name</label><input name="display_name" required></div>
         <div class="field"><label>Home depot</label><select name="depot_id" required><option value="">Choose depot</option>{% for depot in depots %}<option value="{{ depot.id }}">{{ depot.name }}</option>{% endfor %}</select></div>
         <div class="field"><label>Password</label><input name="password" type="password" minlength="6" autocomplete="new-password" required></div>
@@ -1528,7 +1553,7 @@ def depot_access_dashboard():
       </section>
     {% endif %}
     <section class="panel">
-      <h2>Drivers by depot</h2>
+      <h2>Drivers by depot</h2><div class="field"><label for="depot-driver-search">Search driver number or name</label><input id="depot-driver-search" type="search" placeholder="Start typing..."></div>
       {% for depot in managed_depots %}
         <details id="depot-{{ depot.id }}" class="depot-people-group" {% if depot.pending_count %}open{% endif %}>
           <summary>
@@ -1537,7 +1562,7 @@ def depot_access_dashboard():
             {% if depot.pending_count %}<span class="status-badge pending">{{ depot.pending_count }} pending</span>{% endif %}
           </summary>
           {% for item in depot.people %}
-            <details class="compact-record">
+            <details class="compact-record" data-driver-search="{{ (item.display_name ~ ' ' ~ (item.driver_number or item.username))|lower }}">
               <summary>
                 <span class="record-title"><strong>{{ item.display_name }}</strong><span>Driver {{ item.driver_number or item.username }}</span></span>
                 <span>{{ item.depot_name }}</span>
@@ -1636,7 +1661,7 @@ def depot_reset_driver_password(user_id):
     if len(password) < 6:
         flash("Password must be at least 6 characters.")
     else:
-        execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(password), user_id))
+        execute("UPDATE users SET password_hash=?, must_change_password=1 WHERE id=?", (generate_password_hash(password), user_id))
         flash("Driver password reset.")
     return redirect(url_for("depot_access_dashboard"))
 
@@ -1696,7 +1721,7 @@ def change_password():
             flash("New password must be different from your current password.")
         else:
             execute(
-                "UPDATE users SET password_hash = ? WHERE id = ?",
+                "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
                 (generate_password_hash(new_password), user["id"]),
             )
             flash("Password changed successfully.")
@@ -1706,8 +1731,8 @@ def change_password():
     <section class="panel" style="max-width:560px; margin:0 auto;">
       <div class="section-head">
         <div>
-          <h1>Change password</h1>
-          <p class="muted">Update the password for {{ user.display_name }}.</p>
+          <h1>{{ "Set a new password" if required else "Change password" }}</h1>
+          <p class="muted">{% if required %}A temporary password was assigned to your account. Set your own password before continuing.{% else %}Update the password for {{ user.display_name }}.{% endif %}</p>
         </div>
       </div>
       <form method="post" class="stack" autocomplete="off">
@@ -1726,12 +1751,12 @@ def change_password():
         </div>
         <div class="split-actions">
           <button class="btn" type="submit">Change password</button>
-          <a class="btn ghost" href="{{ url_for('index') }}">Cancel</a>
+          {% if not required %}<a class="btn ghost" href="{{ url_for('index') }}">Cancel</a>{% endif %}
         </div>
       </form>
     </section>
     """
-    return render_page("Change password", body, user=user)
+    return render_page("Change password", body, user=user, required=bool(request.args.get("required") or user["must_change_password"]))
 
 
 @app.route("/logout")
@@ -1767,10 +1792,17 @@ def driver_profile():
                 "depot_name": depot["name"],
                 "dispatcher_group_name": depot["group_name"],
             }
-            flash("Shift profile saved.")
+            if request.form.get("remember_defaults"):
+                execute("UPDATE users SET display_name=?, default_truck_number=?, default_depot_id=? WHERE id=?", (driver_name, truck_number, depot["id"], current_user()["id"]))
+                flash("Shift details saved and remembered for next login.")
+            else:
+                flash("Shift details saved for this login.")
             return redirect(url_for("driver_home"))
 
     profile = session.get("shift_profile", {})
+    if not profile:
+        u = current_user()
+        profile = {"driver_name": u["display_name"], "truck_number": u["default_truck_number"] or "", "depot_id": u["default_depot_id"] or u["home_depot_id"]}
     body = """
     <section class="hero">
       <div>
@@ -1799,7 +1831,7 @@ def driver_profile():
             {% endfor %}
           </select>
         </div>
-        <button class="btn" type="submit">Save shift details</button>
+        <label class="chip" style="display:flex;margin-bottom:12px;"><input type="checkbox" name="remember_defaults" style="width:auto;min-height:0;"> Remember these details for future logins</label><button class="btn" type="submit">Continue</button>
       </form>
     </section>
     """
@@ -1963,9 +1995,11 @@ def driver_home():
           if (!field.required) flowActions.innerHTML = '<button class="btn ghost full" type="button" id="skip-answer">Skip</button>';
           document.getElementById("skip-answer")?.addEventListener("click", () => choose(field, ""));
         } else {
-          const inputType = field.type === "number" ? "number" : "text";
+          const numericOnly = field.type === "number" || field.name === "supply_number";
           const multiline = field.type === "note";
-          area.innerHTML = multiline ? `<textarea id="active-answer" rows="4" placeholder="Type a short note">${escapeHtml(answers[field.name] || "")}</textarea>` : `<input id="active-answer" type="${inputType}" value="${escapeHtml(answers[field.name] || "")}" autocomplete="off">`;
+          const numericAttrs = numericOnly ? ' inputmode="numeric" pattern="[0-9]*"' : '';
+          area.innerHTML = multiline ? `<textarea id="active-answer" rows="4" placeholder="Type a short note">${escapeHtml(answers[field.name] || "")}</textarea>` : `<input id="active-answer" type="text"${numericAttrs} value="${escapeHtml(answers[field.name] || "")}" autocomplete="off">`;
+          if (numericOnly) document.getElementById("active-answer").addEventListener("input", (event) => { event.target.value = event.target.value.replace(/\D/g, ""); });
           flowActions.innerHTML = '<button class="btn full driver-next" type="button">Continue</button>';
           flowActions.querySelector("button").addEventListener("click", () => saveTyped(field));
           document.getElementById("active-answer").addEventListener("keydown", (event) => { if (event.key === "Enter" && !multiline) { event.preventDefault(); saveTyped(field); }});
@@ -2198,7 +2232,9 @@ def saved_dispatch_group_names(user_id):
 @roles_required("dispatch", "admin")
 def dispatch_dashboard():
     user = current_user()
-    profile_id = request.args.get("profile_id", "").strip()
+    profile_id = request.args.get("profile_id", "")
+    if not profile_id and user["role"] == "dispatch" and user["default_desk_profile_id"]:
+        profile_id = str(user["default_desk_profile_id"]).strip()
     selected_group_ids = request.args.getlist("group_id")
     selected_group_names = []
     if selected_group_ids:
@@ -2348,7 +2384,7 @@ def dispatch_dashboard():
         <form class="inline" method="get">
           <input type="hidden" name="view" value="{{ view_mode }}">
           <select id="desk-profile-select" name="profile_id" style="width: 220px;">
-            <option value="">Load desk profile</option>
+            <option value="">Custom view</option>
             {% for profile in desk_profiles %}
               <option value="{{ profile.id }}" {% if profile_id|string == profile.id|string %}selected{% endif %}>{{ profile.name }}</option>
             {% endfor %}
@@ -2379,7 +2415,7 @@ def dispatch_dashboard():
         </form>
       </div>
       <div class="inline" style="margin-top: 10px;">
-        <button id="multi-select-toggle" class="btn ghost" type="button">Multi select</button>
+        <button id="multi-select-toggle" class="btn ghost" type="button">Select completed requests</button>
         <span class="small">Select Done items only when cleanup is needed.</span>
       </div>
       <form id="bulk-delete-done-form" class="bulk-delete-tools" method="post" action="{{ url_for('bulk_delete_done_requests') }}" onsubmit="return confirm('Delete selected Done requests? This will remove their comments too.');">
@@ -2949,7 +2985,7 @@ def admin_dashboard():
     pending_rows = query_all("""
         SELECT home_depot_id, COUNT(*) AS pending_count
         FROM users
-        WHERE COALESCE(access_role, role) = 'driver' AND access_status = 'pending'
+        WHERE COALESCE(access_role, role) = 'driver' AND access_status = 'pending' AND active = 0
         GROUP BY home_depot_id
     """)
     pending_by_depot = {row["home_depot_id"]: row["pending_count"] for row in pending_rows}
@@ -2975,7 +3011,7 @@ def admin_dashboard():
     {% endif %}
 
     <details id="users" class="panel admin-section" open>
-      <summary>Users <span class="small">{{ users|length }}</span></summary>
+      <summary>Users <span class="small">{{ users|length }}</span></summary><div class="field" style="margin-top:12px;"><label for="admin-driver-search">Search driver number or name</label><input id="admin-driver-search" type="search" placeholder="Start typing..."></div>
       <details class="admin-create">
         <summary class="btn secondary compact" style="width:max-content;">Add user</summary>
         <form method="post" action="{{ url_for('admin_create_user') }}" class="grid three" style="margin-top:12px;">
@@ -2987,7 +3023,7 @@ def admin_dashboard():
         </form>
       </details>
       {% macro user_record(item) %}
-        <details class="compact-record">
+        <details class="compact-record" data-driver-search="{{ (item.display_name ~ ' ' ~ item.username ~ ' ' ~ (item.driver_number or ''))|lower }}">
           <summary>
             <span class="record-title"><strong>{{ item.display_name }}</strong><span>{{ item.username }}</span></span>
             <span>{{ item.home_depot_name or item.effective_role|title }}</span>
@@ -2997,7 +3033,7 @@ def admin_dashboard():
             <form id="user-save-{{ item.id }}" method="post" action="{{ url_for('admin_update_user', user_id=item.id) }}" class="grid three">
               <div class="field"><label>Username / driver number</label><input name="username" value="{{ item.username }}" required></div>
               <div class="field"><label>Display name</label><input name="display_name" value="{{ item.display_name }}" required></div>
-              <div class="field"><label>Role</label><select name="role">{% for role in ['driver','dispatch','depot','admin'] %}<option value="{{ role }}" {% if item.effective_role == role %}selected{% endif %}>{{ role|title }}</option>{% endfor %}</select></div>
+              <div class="field"><label>Role</label><select name="role">{% for role in ['driver','dispatch','depot','admin'] %}<option value="{{ role }}" {% if item.effective_role == role %}selected{% endif %}>{{ role|title }}</option>{% endfor %}</select></div><div class="field"><label>Home depot (drivers)</label><select name="home_depot_id"><option value="">Unassigned</option>{% for depot in depots_all %}<option value="{{ depot.id }}" {% if item.home_depot_id == depot.id %}selected{% endif %}>{{ depot.name }}</option>{% endfor %}</select></div><div class="field"><label>Default desk profile (dispatch)</label><select name="default_desk_profile_id"><option value="">No default profile</option>{% for profile in desk_profiles %}<option value="{{ profile.id }}" {% if item.default_desk_profile_id == profile.id %}selected{% endif %}>{{ profile.name }}</option>{% endfor %}</select></div>
             </form>
             {% if item.effective_role == 'depot' %}
               <details style="margin-top:12px;">
@@ -3066,7 +3102,7 @@ def admin_dashboard():
         <form method="post" action="{{ url_for('admin_create_desk_profile') }}" class="grid three" style="margin-top:12px;">
           <div class="field"><label>Desk name</label><input name="name" required></div><div class="field"><label>Description</label><input name="description"></div><div class="field"><label>Sort</label><input name="sort_order" type="number" value="100"></div>
           <div class="field" style="grid-column:1/-1;"><label>Queues</label><div class="choice-tiles">{% for group in groups_all %}<label class="chip"><input type="checkbox" name="group_id" value="{{ group.id }}" style="width:auto;min-height:0;"> {{ group.name }}</label>{% endfor %}</div></div>
-          <label class="chip"><input type="checkbox" name="is_default" style="width:auto;min-height:0;"> Standard default</label><div><button class="btn" type="submit">Add desk</button></div>
+          <div><button class="btn" type="submit">Add desk</button></div>
         </form>
       </details>
       {% for profile in desk_profiles %}
@@ -3075,7 +3111,7 @@ def admin_dashboard():
           <div class="record-body"><form id="desk-save-{{ profile.id }}" method="post" action="{{ url_for('admin_update_desk_profile', profile_id=profile.id) }}" class="grid three">
             <div class="field"><label>Name</label><input name="name" value="{{ profile.name }}" required></div><div class="field"><label>Description</label><input name="description" value="{{ profile.description or '' }}"></div><div class="field"><label>Sort</label><input name="sort_order" type="number" value="{{ profile.sort_order }}"></div>
             <div class="field" style="grid-column:1/-1;"><label>Queues</label><div class="choice-tiles">{% for group in groups_all %}<label class="chip"><input type="checkbox" name="group_id" value="{{ group.id }}" style="width:auto;min-height:0;" {% if group.id in profile.group_ids %}checked{% endif %}> {{ group.name }}</label>{% endfor %}</div></div>
-            <label class="chip"><input type="checkbox" name="active" style="width:auto;min-height:0;" {% if profile.active %}checked{% endif %}> Active</label><label class="chip"><input type="checkbox" name="is_default" style="width:auto;min-height:0;" {% if profile.is_default %}checked{% endif %}> Standard default</label>
+            <label class="chip"><input type="checkbox" name="active" style="width:auto;min-height:0;" {% if profile.active %}checked{% endif %}> Active</label>
           </form><div class="record-actions"><button class="btn secondary" form="desk-save-{{ profile.id }}" type="submit">Save desk</button><form method="post" action="{{ url_for('admin_delete_desk_profile', profile_id=profile.id) }}" onsubmit="return confirm('Delete this desk profile?');"><button class="btn red" type="submit">Delete</button></form></div></div>
         </details>
       {% endfor %}
@@ -3326,7 +3362,10 @@ def admin_create_user():
                 now_iso(),
             ),
         )
-        flash("User created.")
+        new_user = query_one("SELECT id FROM users WHERE username = ?", (values["username"],))
+        if new_user:
+            execute("UPDATE users SET must_change_password = 1 WHERE id = ?", (new_user["id"],))
+        flash("User created with a temporary password.")
     except sqlite3.IntegrityError:
         flash("That username is already in use.")
     return redirect(url_for("admin_dashboard"))
@@ -3344,10 +3383,13 @@ def admin_update_user(user_id):
         execute(
             """
             UPDATE users
-            SET username = ?, display_name = ?, role = ?, access_role = ?
+            SET username = ?, display_name = ?, role = ?, access_role = ?,
+                driver_number = CASE WHEN ? = 'driver' THEN ? ELSE driver_number END,
+                home_depot_id = CASE WHEN ? = 'driver' THEN ? ELSE home_depot_id END,
+                default_desk_profile_id = CASE WHEN ? = 'dispatch' THEN ? ELSE default_desk_profile_id END
             WHERE id = ?
             """,
-            (values["username"], values["display_name"], storage_role, access_role, user_id),
+            (values["username"], values["display_name"], storage_role, access_role, values["role"], values["username"], values["role"], request.form.get("home_depot_id") or None, values["role"], request.form.get("default_desk_profile_id") or None, user_id),
         )
         flash("User updated.")
     except sqlite3.IntegrityError:
@@ -3363,7 +3405,7 @@ def admin_reset_password(user_id):
         flash("Enter a new password.")
     else:
         execute(
-            "UPDATE users SET password_hash = ? WHERE id = ?",
+            "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?",
             (generate_password_hash(password), user_id),
         )
         flash("Password reset.")
@@ -3694,10 +3736,8 @@ def admin_create_desk_profile():
                     (name, description, is_default, active, sort_order)
                 VALUES (?, ?, ?, 1, ?)
                 """,
-                (name, description, 1 if request.form.get("is_default") else 0, sort_order),
+                (name, description, 0, sort_order),
             )
-            if request.form.get("is_default"):
-                db.execute("UPDATE desk_profiles SET is_default = 0 WHERE id != ?", (cur.lastrowid,))
             replace_desk_profile_groups(db, cur.lastrowid, group_ids)
             db.commit()
         flash("Desk profile created.")
@@ -3713,7 +3753,7 @@ def admin_update_desk_profile(profile_id):
         profile = db.execute("SELECT id FROM desk_profiles WHERE id = ?", (profile_id,)).fetchone()
         if not profile:
             abort(404)
-        is_default = 1 if request.form.get("is_default") else 0
+        is_default = 0
         db.execute(
             """
             UPDATE desk_profiles
@@ -3729,8 +3769,6 @@ def admin_update_desk_profile(profile_id):
                 profile_id,
             ),
         )
-        if is_default:
-            db.execute("UPDATE desk_profiles SET is_default = 0 WHERE id != ?", (profile_id,))
         replace_desk_profile_groups(db, profile_id, request.form.getlist("group_id"))
         db.commit()
     flash("Desk profile updated.")
