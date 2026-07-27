@@ -39,7 +39,7 @@ class DriverPortalSmokeTest(unittest.TestCase):
         self.assertIn('"receipt_mode": "none"', split["form_schema"])
         cip = portal.query_one("SELECT id FROM request_types WHERE label = 'CIPs'")
         editor = self.client.get(f"/admin/request-types/{cip['id']}/edit")
-        self.assertIn(b"Edit driver flow", editor.data)
+        self.assertIn(b"Edit driver option", editor.data)
         self.assertIn(b"Add CIP Start Of Day", editor.data)
 
         self.client.post(
@@ -95,8 +95,9 @@ class DriverPortalSmokeTest(unittest.TestCase):
             },
             follow_redirects=True,
         )
-        self.assertIn(b"choice-tile", driver_home.data)
-        self.assertIn(b"request-back-button", driver_home.data)
+        self.assertIn(b"driver-answer", driver_home.data)
+        self.assertIn(b"flow-back", driver_home.data)
+        self.assertIn(b"flow-review", driver_home.data)
         self.assertIn(b'id="request-buttons"', driver_home.data)
         req_type = portal.query_one("SELECT id FROM request_types WHERE label = 'CIPs'")
         self.client.post(
@@ -140,9 +141,8 @@ class DriverPortalSmokeTest(unittest.TestCase):
         self.assertIn("<th>Supply No</th>", dispatch_html)
         self.assertIn("<strong>SUP-12345</strong>", dispatch_html)
         self.assertIn("<strong>Driver:</strong> Gate code is 1234", dispatch_html)
-        self.assertIn("Volume: 0-500L", dispatch_html)
+        self.assertIn("Milk left behind: 0-500L", dispatch_html)
         self.assertNotIn("Supply number: SUP-12345", dispatch_html)
-        self.assertNotIn("Milk left behind: 0-500L", dispatch_html)
         self.assertNotIn("Message: Milk left behind", dispatch_html)
         group = portal.query_one("SELECT id, name FROM dispatcher_groups WHERE name = 'Te Rapa'")
         self.client.post(
@@ -189,44 +189,6 @@ class DriverPortalSmokeTest(unittest.TestCase):
         )
         completed = portal.query_one("SELECT status FROM driver_requests WHERE id = ?", (request_row["id"],))
         self.assertEqual(completed["status"], "done")
-        self.client.get("/logout")
-
-        self.login("driver1", "pass123")
-        self.client.post(
-            "/driver/profile",
-            data={
-                "driver_name": "Driver One",
-                "truck_number": "T42",
-                "depot_id": depot["id"],
-            },
-            follow_redirects=True,
-        )
-        history_page = self.client.get("/driver")
-        history_html = history_page.data.decode()
-        self.assertIn("Old requests", history_html)
-        self.assertIn("driver-request-history", history_html)
-        self.assertIn("Add CIP Start Of Day", history_html)
-        history_section = history_html.split('id="driver-request-history"', 1)[1]
-        self.assertNotIn(">Done</span>", history_section)
-        self.assertNotIn(">Sent</span>", history_section)
-        self.client.post(
-            f"/driver/request/{request_row['id']}/dismiss",
-            follow_redirects=True,
-        )
-        hidden = portal.query_one(
-            "SELECT driver_hidden_at FROM driver_requests WHERE id = ?",
-            (request_row["id"],),
-        )
-        self.assertIsNotNone(hidden["driver_hidden_at"])
-        driver_api = self.client.get("/api/driver/requests").get_json()
-        visible_ids = [
-            item["id"]
-            for item in driver_api["active_requests"] + driver_api["history_requests"]
-        ]
-        self.assertNotIn(request_row["id"], visible_ids)
-        self.client.get("/logout")
-
-        self.login("dispatch1", "pass123")
         self.client.post(
             "/dispatch/requests/delete-done",
             data={"request_id": str(request_row["id"])},

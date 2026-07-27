@@ -101,3 +101,23 @@ git branch -M main
 git remote add origin https://github.com/YOUR-USERNAME/YOUR-REPO.git
 git push -u origin main
 ```
+
+## Refined driver flow editor
+
+The current version includes a mobile guided driver flow and an improved admin editor for nested questions.
+
+Administrators can now:
+
+- Add choice, Yes/No, short-text, number, and longer-note questions.
+- Reorder questions.
+- Set a question to appear only when an earlier choice equals a specified answer.
+- Rename questions without changing their stable internal key.
+- Duplicate an existing driver option before editing it.
+
+Existing request schemas remain compatible. See `CHANGELOG.md` for the implemented changes.
+
+## Driver access onboarding
+
+Drivers can select **Request access** on the login screen and enter their driver number, name, home depot, and password. The driver number becomes the username. The account remains inactive until approved.
+
+Administrators create users with the **Depot** role and assign their permitted depots in Admin > Users. Depot users then use **Depot access** to approve or reject only the pending driver accounts for those depots.

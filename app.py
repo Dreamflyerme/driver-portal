@@ -222,8 +222,13 @@ def migrate_db(db):
     ensure_column(db, "request_types", "button_color", "TEXT DEFAULT '#2563eb'")
     ensure_column(db, "driver_requests", "details_json", "TEXT")
     ensure_column(db, "driver_requests", "supply_number", "TEXT")
-    ensure_column(db, "driver_requests", "driver_hidden_at", "TEXT")
     ensure_column(db, "request_comments", "visible_to_driver", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(db, "users", "access_role", "TEXT")
+    ensure_column(db, "users", "driver_number", "TEXT")
+    ensure_column(db, "users", "home_depot_id", "INTEGER REFERENCES depots(id) ON DELETE SET NULL")
+    ensure_column(db, "users", "access_status", "TEXT NOT NULL DEFAULT 'approved'")
+    ensure_column(db, "users", "reviewed_at", "TEXT")
+    ensure_column(db, "users", "reviewed_by", "INTEGER")
 
 
 def init_db():
@@ -281,7 +286,6 @@ def init_db():
                 created_at TEXT NOT NULL,
                 acknowledged_at TEXT,
                 completed_at TEXT
-                driver_hidden_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS request_comments (
@@ -313,6 +317,12 @@ def init_db():
                 desk_profile_id INTEGER NOT NULL REFERENCES desk_profiles(id) ON DELETE CASCADE,
                 dispatcher_group_id INTEGER NOT NULL REFERENCES dispatcher_groups(id) ON DELETE CASCADE,
                 PRIMARY KEY (desk_profile_id, dispatcher_group_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS user_depots (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                depot_id INTEGER NOT NULL REFERENCES depots(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_id, depot_id)
             );
             """
         )
@@ -497,7 +507,7 @@ def current_user():
     if not user_id:
         return None
     return query_one(
-        "SELECT id, username, display_name, role, active FROM users WHERE id = ?",
+        "SELECT id, username, display_name, COALESCE(access_role, role) AS role, active, driver_number, home_depot_id, access_status FROM users WHERE id = ?",
         (user_id,),
     )
 
@@ -585,6 +595,10 @@ def parse_form_schema(raw):
         return {"fields": []}
     parsed.setdefault("fields", [])
     parsed.setdefault("receipt_mode", "none")
+    parsed.setdefault("version", 2)
+    for index, field in enumerate(parsed["fields"]):
+        field.setdefault("id", field.get("name") or f"field_{index + 1}")
+        field.setdefault("name", field["id"])
     return parsed
 
 
@@ -692,21 +706,7 @@ def supply_number_from_details(details):
     return (details.get("supply_number") or "").strip()
 
 
-def normalize_display_label(value):
-    return "".join(char.lower() for char in str(value or "") if char.isalnum())
-
-
-def fallback_detail_label(key):
-    if key.endswith("_volume"):
-        return "Volume"
-    if key.endswith("_action"):
-        return "Action"
-    if key.endswith("_number"):
-        return "Number"
-    return key.replace("_", " ").title()
-
-
-def request_details_for_display(details_json, schema=None, request_label=""):
+def request_details_for_display(details_json, schema=None):
     if not details_json:
         return []
     try:
@@ -719,35 +719,17 @@ def request_details_for_display(details_json, schema=None, request_label=""):
         for field in schema.get("fields", []):
             labels[field.get("name")] = field.get("label", field.get("name"))
 
-    display_details = []
-    normalized_request_label = normalize_display_label(request_label)
-    for key, value in details.items():
-        if not value or key == "supply_number":
-            continue
-        label = labels.get(key, key.replace("_", " ").title())
-        if normalize_display_label(label) == normalized_request_label:
-            label = fallback_detail_label(key)
-        if normalize_display_label(label) == normalized_request_label:
-            label = ""
-        display_details.append({"label": label, "value": value})
-    return display_details
+    return [
+        {"label": labels.get(key, key.replace("_", " ").title()), "value": value}
+        for key, value in details.items()
+        if value and key != "supply_number"
+    ]
 
 
 def details_summary(details):
     if not details:
         return ""
-    return "; ".join(
-        f"{detail['label']}: {detail['value']}" if detail["label"] else str(detail["value"])
-        for detail in details
-    )
-
-
-def driver_request_bucket(item):
-    if item["status"] == "done":
-        return "history"
-    if item["receipt_mode"] == "ack_only" and item["status"] == "acknowledged":
-        return "history"
-    return "active"
+    return "; ".join(f"{detail['label']}: {detail['value']}" for detail in details)
 
 
 def enrich_request_item(row):
@@ -759,7 +741,7 @@ def enrich_request_item(row):
     schema = parse_form_schema(type_row["form_schema"]) if type_row else {"fields": []}
     receipt_mode = receipt_mode_for_schema(schema)
     driver_label, driver_class = driver_status_for(item["status"], receipt_mode)
-    details = request_details_for_display(item["details_json"], schema, item["request_type_label"])
+    details = request_details_for_display(item["details_json"], schema)
     item["details"] = details
     item["details_summary"] = details_summary(details)
     if not item.get("supply_number") and item.get("details_json"):
@@ -778,7 +760,6 @@ def enrich_request_item(row):
     }.get(item["status"], "row-new")
     item["can_acknowledge"] = item["status"] == "new" and receipt_mode != "none"
     item["can_complete"] = item["status"] in {"new", "acknowledged"}
-    item["driver_bucket"] = driver_request_bucket(item)
     return item
 
 
@@ -1263,6 +1244,76 @@ BASE_TEMPLATE = """
       tr { border-bottom: 1px solid var(--line); padding: 8px 0; }
       td { border-bottom: 0; padding: 6px 0; }
     }
+
+    .btn.compact { min-height: 34px; padding: 6px 10px; }
+    .btn:disabled { opacity: .4; cursor: default; }
+    .driver-flow[hidden], .send-state[hidden], [hidden] { display: none !important; }
+    .flow-topline { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:18px; }
+    .driver-question h3 { font-size:24px; margin-bottom:16px; }
+    .question-heading { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    .driver-answer-buttons { display:grid; gap:11px; }
+    .driver-answer { width:100%; min-height:64px; border:2px solid #cbd5e1; border-radius:10px; background:#fff; color:var(--ink); font:inherit; font-size:18px; font-weight:800; padding:12px; cursor:pointer; }
+    .driver-answer:active, .driver-answer.selected { border-color:var(--blue); background:#eff6ff; }
+    .flow-actions { margin-top:16px; }
+    .driver-next, .driver-send { min-height:58px; font-size:17px; }
+    .review-card { border:1px solid var(--line); border-radius:10px; padding:14px; background:#f8fafc; }
+    .review-row { display:flex; justify-content:space-between; gap:14px; padding:10px 0; border-bottom:1px solid var(--line); }
+    .review-row:last-child { border-bottom:0; }
+    .send-state { text-align:center; padding:26px 10px; }
+    .success-mark { width:68px; height:68px; margin:0 auto 14px; border-radius:50%; background:#dcfce7; color:#166534; display:grid; place-items:center; font-size:38px; font-weight:900; }
+    .error-message { background:#fee2e2; color:#991b1b; padding:12px; border-radius:8px; margin-top:10px; }
+    .input-error { border-color:var(--red) !important; }
+    .admin-flow-layout { align-items:start; }
+    .admin-preview { position:sticky; top:16px; }
+    .preview-phone { margin-top:14px; border:8px solid #0f172a; border-radius:26px; padding:18px 12px; min-height:360px; background:#f8fafc; }
+    .preview-question { background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px; margin-top:9px; }
+    .question-editor form { margin:0; }
+    .admin-create { margin: 12px 0 16px; }
+    .compact-record { border:1px solid var(--line); border-radius:10px; background:#fff; overflow:hidden; margin-top:8px; }
+    .compact-record > summary { cursor:pointer; list-style:none; display:grid; grid-template-columns:minmax(180px, 2fr) minmax(120px, 1fr) minmax(100px, .8fr) auto; align-items:center; gap:12px; padding:12px 14px; font-weight:800; }
+    .compact-record > summary::-webkit-details-marker { display:none; }
+    .compact-record > summary:hover { background:#f8fafc; }
+    .compact-record > summary::after { content:'Manage'; color:var(--blue); font-size:13px; justify-self:end; }
+    .compact-record[open] > summary { border-bottom:1px solid var(--line); background:#f8fafc; }
+    .compact-record[open] > summary::after { content:'Close'; }
+    .record-body { padding:14px; }
+    .record-title { min-width:0; }
+    .record-title strong, .record-title span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .record-title span { color:var(--muted); font-size:12px; font-weight:600; margin-top:2px; }
+    .status-badge { display:inline-flex; width:max-content; border-radius:999px; padding:4px 8px; font-size:12px; font-weight:900; background:#e2e8f0; color:#334155; }
+    .status-badge.active { background:#dcfce7; color:#166534; }
+    .status-badge.pending { background:#fef3c7; color:#92400e; }
+    .status-badge.inactive { background:#fee2e2; color:#991b1b; }
+    .record-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+    .routing-summary { color:var(--muted); font-size:13px; }
+    .admin-list-head { display:grid; grid-template-columns:minmax(180px, 2fr) minmax(120px, 1fr) minmax(100px, .8fr) auto; gap:12px; padding:0 14px 5px; color:var(--muted); font-size:12px; font-weight:900; text-transform:uppercase; letter-spacing:.04em; }
+    .user-role-group, .driver-depot-group { border:1px solid var(--line); border-radius:14px; margin:10px 0; background:rgba(255,255,255,.5); overflow:hidden; }
+    .user-role-group > summary, .driver-depot-group > summary { cursor:pointer; list-style:none; padding:13px 14px; font-weight:900; display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .user-role-group > summary::-webkit-details-marker, .driver-depot-group > summary::-webkit-details-marker { display:none; }
+    .user-role-group > summary::after, .driver-depot-group > summary::after { content:'+'; font-size:20px; color:var(--muted); margin-left:auto; }
+    .user-role-group[open] > summary::after, .driver-depot-group[open] > summary::after { content:'−'; }
+    .user-role-group > .compact-record, .driver-depot-group > .compact-record { margin:8px 10px; }
+    .driver-depot-group { margin:8px 12px 12px; background:var(--surface); }
+    .driver-depot-group > summary { padding:11px 12px; }
+    .empty-group { padding:0 14px 14px; }
+    .pending-overview { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0 18px; }
+    .pending-link { display:inline-flex; align-items:center; gap:8px; padding:9px 12px; border-radius:999px; background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; font-weight:900; text-decoration:none; }
+    .pending-count { display:inline-grid; place-items:center; min-width:24px; height:24px; padding:0 7px; border-radius:999px; background:#f97316; color:white; font-size:12px; }
+    .depot-people-group { border:1px solid var(--line); border-radius:14px; margin:10px 0; overflow:hidden; background:#fff; }
+    .depot-people-group > summary { cursor:pointer; list-style:none; display:flex; align-items:center; gap:10px; padding:14px; font-weight:900; }
+    .depot-people-group > summary::-webkit-details-marker { display:none; }
+    .depot-people-group > summary::after { content:'+'; margin-left:auto; color:var(--muted); font-size:20px; }
+    .depot-people-group[open] > summary::after { content:'−'; }
+    .depot-people-group .compact-record { margin:8px 10px; }
+    @media (max-width: 760px) {
+      .driver-layout { display:block; }
+      .driver-history-panel { margin-top:14px; }
+      .driver-hero { align-items:flex-start; }
+      .request-buttons { grid-template-columns:1fr; }
+      .request-buttons .btn { min-height:68px; font-size:17px; }
+      .driver-send-panel { padding:14px; }
+      .admin-preview { position:static; }
+    }
   </style>
 </head>
 <body>
@@ -1274,7 +1325,9 @@ BASE_TEMPLATE = """
           <span class="chip">{{ user.display_name }} · {{ user.role|title }}</span>
           {% if user.role == 'driver' %}<a href="{{ url_for('driver_home') }}">Driver</a>{% endif %}
           {% if user.role in ['dispatch', 'admin'] %}<a href="{{ url_for('dispatch_dashboard') }}">Dispatch</a>{% endif %}
+          {% if user.role == 'depot' %}<a href="{{ url_for('depot_access_dashboard') }}">Depot people</a>{% endif %}
           {% if user.role == 'admin' %}<a href="{{ url_for('admin_dashboard') }}">Admin</a>{% endif %}
+          <a href="{{ url_for('change_password') }}">Change password</a>
           <a href="{{ url_for('logout') }}">Logout</a>
         {% endif %}
       </nav>
@@ -1309,6 +1362,8 @@ def index():
         return redirect(url_for("driver_home"))
     if user["role"] == "dispatch":
         return redirect(url_for("dispatch_dashboard"))
+    if user["role"] == "depot":
+        return redirect(url_for("depot_access_dashboard"))
     return redirect(url_for("admin_dashboard"))
 
 
@@ -1318,7 +1373,11 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         user = query_one("SELECT * FROM users WHERE username = ?", (username,))
-        if not user or not user["active"] or not check_password_hash(user["password_hash"], password):
+        if user and check_password_hash(user["password_hash"], password) and not user["active"] and user["access_status"] == "pending":
+            flash("Your access request is waiting for depot approval.")
+        elif user and check_password_hash(user["password_hash"], password) and not user["active"] and user["access_status"] == "rejected":
+            flash("Your access request was not approved. Contact your depot team.")
+        elif not user or not user["active"] or not check_password_hash(user["password_hash"], password):
             flash("Login failed. Check the username and password.")
         else:
             session.clear()
@@ -1347,10 +1406,332 @@ def login():
         </div>
         <button class="btn full" type="submit">Login</button>
       </form>
+      <a class="btn ghost full" style="margin-top:12px;" href="{{ url_for('request_access') }}">Request access</a>
       <p class="small" style="margin-top: 14px;">First run admin: username <strong>admin</strong>, password <strong>admin123</strong>.</p>
     </section>
     """
     return render_page("Login", body)
+
+
+@app.route("/request-access", methods=["GET", "POST"])
+def request_access():
+    depots = depot_options()
+    if request.method == "POST":
+        driver_number = request.form.get("driver_number", "").strip()
+        display_name = request.form.get("display_name", "").strip()
+        depot_id = request.form.get("depot_id", "").strip()
+        password = request.form.get("password", "")
+        if not driver_number or not display_name or not depot_id or len(password) < 6:
+            flash("Complete all fields. Password must be at least 6 characters.")
+        elif not query_one("SELECT id FROM depots WHERE id = ? AND active = 1", (depot_id,)):
+            flash("Choose a valid depot.")
+        else:
+            username = driver_number
+            try:
+                execute("""
+                    INSERT INTO users
+                    (username, display_name, password_hash, role, active, created_at,
+                     driver_number, home_depot_id, access_status)
+                    VALUES (?, ?, ?, 'driver', 0, ?, ?, ?, 'pending')
+                """, (username, display_name, generate_password_hash(password), now_iso(), driver_number, depot_id))
+                flash("Access requested. Your depot team must approve the account before you can log in.")
+                return redirect(url_for("login"))
+            except sqlite3.IntegrityError:
+                flash("That driver number already has an account or pending request.")
+    body = """
+    <section class="panel" style="max-width:560px;margin:auto;">
+      <h1>Request driver access</h1>
+      <p>Your driver number will be your username. The depot team will review the request.</p>
+      <form method="post">
+        <div class="field"><label>Driver number</label><input name="driver_number" inputmode="numeric" required autofocus></div>
+        <div class="field"><label>Your name</label><input name="display_name" required></div>
+        <div class="field"><label>Home depot</label><select name="depot_id" required><option value="">Choose depot</option>{% for depot in depots %}<option value="{{ depot.id }}">{{ depot.name }}</option>{% endfor %}</select></div>
+        <div class="field"><label>Password</label><input name="password" type="password" minlength="6" autocomplete="new-password" required></div>
+        <button class="btn full" type="submit">Submit access request</button>
+        <a class="btn ghost full" style="margin-top:10px;" href="{{ url_for('login') }}">Back to login</a>
+      </form>
+    </section>
+    """
+    return render_page("Request access", body, depots=depots)
+
+
+def permitted_depot_ids(user):
+    if user["role"] == "admin":
+        return [row["id"] for row in query_all("SELECT id FROM depots")]
+    return [row["depot_id"] for row in query_all("SELECT depot_id FROM user_depots WHERE user_id = ?", (user["id"],))]
+
+
+def depot_managed_driver(user_id, manager=None):
+    manager = manager or current_user()
+    target = query_one(
+        """
+        SELECT id, username, display_name, role, COALESCE(access_role, role) AS effective_role,
+               active, driver_number, home_depot_id, access_status
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,),
+    )
+    if not target:
+        abort(404)
+    if target["effective_role"] != "driver":
+        abort(403)
+    if target["home_depot_id"] not in permitted_depot_ids(manager):
+        abort(403)
+    return target
+
+
+@app.route("/depot-access")
+@roles_required("depot", "admin")
+def depot_access_dashboard():
+    user = current_user()
+    depot_ids = permitted_depot_ids(user)
+    people = []
+    managed_depots = []
+    if depot_ids:
+        placeholders = ",".join("?" for _ in depot_ids)
+        managed_depots = [dict(row) for row in query_all(
+            f"SELECT id, name FROM depots WHERE id IN ({placeholders}) AND active = 1 ORDER BY name",
+            depot_ids,
+        )]
+        people = [dict(row) for row in query_all(
+            f"""
+            SELECT u.*, d.name AS depot_name
+            FROM users u
+            JOIN depots d ON d.id = u.home_depot_id
+            WHERE COALESCE(u.access_role, u.role) = 'driver'
+              AND u.home_depot_id IN ({placeholders})
+            ORDER BY
+              d.name,
+              CASE u.access_status WHEN 'pending' THEN 0 ELSE 1 END,
+              u.display_name
+            """,
+            depot_ids,
+        )]
+    for depot in managed_depots:
+        depot["people"] = [person for person in people if person["home_depot_id"] == depot["id"]]
+        depot["pending_count"] = sum(1 for person in depot["people"] if person["access_status"] == "pending")
+
+    body = """
+    <section class="hero">
+      <div><h1>Depot people</h1><p>Approve and manage drivers for your assigned depots.</p></div>
+    </section>
+    {% set total_pending = managed_depots|sum(attribute='pending_count') %}
+    {% if total_pending %}
+      <section class="panel" style="border-color:#fed7aa;background:#fffaf5;">
+        <h2 style="margin-bottom:6px;">Pending approvals <span class="status-badge pending">{{ total_pending }}</span></h2>
+        <div class="pending-overview">
+          {% for depot in managed_depots if depot.pending_count %}
+            <a class="pending-link" href="#depot-{{ depot.id }}"><span>{{ depot.name }}</span><span class="pending-count">{{ depot.pending_count }}</span></a>
+          {% endfor %}
+        </div>
+      </section>
+    {% endif %}
+    <section class="panel">
+      <h2>Drivers by depot</h2>
+      {% for depot in managed_depots %}
+        <details id="depot-{{ depot.id }}" class="depot-people-group" {% if depot.pending_count %}open{% endif %}>
+          <summary>
+            <span>{{ depot.name }}</span>
+            <span class="small">{{ depot.people|length }} driver{{ '' if depot.people|length == 1 else 's' }}</span>
+            {% if depot.pending_count %}<span class="status-badge pending">{{ depot.pending_count }} pending</span>{% endif %}
+          </summary>
+          {% for item in depot.people %}
+            <details class="compact-record">
+              <summary>
+                <span class="record-title"><strong>{{ item.display_name }}</strong><span>Driver {{ item.driver_number or item.username }}</span></span>
+                <span>{{ item.depot_name }}</span>
+                <span class="status-badge {{ 'active' if item.active else ('pending' if item.access_status == 'pending' else 'inactive') }}">{{ 'Active' if item.active else ('Pending' if item.access_status == 'pending' else ('Rejected' if item.access_status == 'rejected' else 'Inactive')) }}</span>
+              </summary>
+              <div class="record-body">
+                <form id="depot-user-save-{{ item.id }}" method="post" action="{{ url_for('depot_update_driver', user_id=item.id) }}" class="grid three">
+                  <div class="field"><label>Name</label><input name="display_name" value="{{ item.display_name }}" required></div>
+                  <div class="field"><label>Driver number</label><input name="driver_number" value="{{ item.driver_number or item.username }}" required></div>
+                  <div class="field"><label>Home depot</label><select name="home_depot_id" required>{% for destination in managed_depots %}<option value="{{ destination.id }}" {% if destination.id == item.home_depot_id %}selected{% endif %}>{{ destination.name }}</option>{% endfor %}</select></div>
+                </form>
+                <div class="record-actions">
+                  {% if item.access_status == 'pending' %}
+                    <form method="post" action="{{ url_for('approve_driver_access', user_id=item.id) }}"><button class="btn" type="submit">Approve</button></form>
+                    <form method="post" action="{{ url_for('reject_driver_access', user_id=item.id) }}"><button class="btn red" type="submit">Reject</button></form>
+                  {% endif %}
+                  <button class="btn secondary" form="depot-user-save-{{ item.id }}" type="submit">Save details</button>
+                  <details><summary class="btn amber" style="list-style:none;">Reset password</summary><form method="post" action="{{ url_for('depot_reset_driver_password', user_id=item.id) }}" class="inline" style="margin-top:8px;"><input name="password" type="password" minlength="6" placeholder="New password" required style="width:170px;"><button class="btn amber" type="submit">Apply</button></form></details>
+                  <form method="post" action="{{ url_for('depot_toggle_driver', user_id=item.id) }}"><button class="btn ghost" type="submit">{{ 'Make inactive' if item.active else 'Make active' }}</button></form>
+                  <form method="post" action="{{ url_for('depot_delete_driver', user_id=item.id) }}" onsubmit="return confirm('Delete this driver account? Existing request history will remain.');"><button class="btn red" type="submit">Delete</button></form>
+                </div>
+              </div>
+            </details>
+          {% else %}
+            <p class="small empty-group">No drivers assigned to this depot.</p>
+          {% endfor %}
+        </details>
+      {% else %}
+        <p class="small">No depots are assigned to your account.</p>
+      {% endfor %}
+    </section>
+    """
+    return render_page("Depot people", body, managed_depots=managed_depots)
+
+
+@app.route("/depot-access/<int:user_id>/approve", methods=["POST"])
+@roles_required("depot", "admin")
+def approve_driver_access(user_id):
+    user = current_user()
+    target = depot_managed_driver(user_id, user)
+    if target["access_status"] != "pending":
+        abort(404)
+    execute(
+        "UPDATE users SET active=1, access_status='approved', reviewed_at=?, reviewed_by=? WHERE id=?",
+        (now_iso(), user["id"], user_id),
+    )
+    flash("Driver access approved.")
+    return redirect(url_for("depot_access_dashboard"))
+
+
+@app.route("/depot-access/<int:user_id>/reject", methods=["POST"])
+@roles_required("depot", "admin")
+def reject_driver_access(user_id):
+    user = current_user()
+    target = depot_managed_driver(user_id, user)
+    if target["access_status"] != "pending":
+        abort(404)
+    execute(
+        "UPDATE users SET active=0, access_status='rejected', reviewed_at=?, reviewed_by=? WHERE id=?",
+        (now_iso(), user["id"], user_id),
+    )
+    flash("Driver access rejected.")
+    return redirect(url_for("depot_access_dashboard"))
+
+
+@app.route("/depot-access/<int:user_id>/update", methods=["POST"])
+@roles_required("depot", "admin")
+def depot_update_driver(user_id):
+    manager = current_user()
+    depot_managed_driver(user_id, manager)
+    display_name = request.form.get("display_name", "").strip()
+    driver_number = request.form.get("driver_number", "").strip()
+    depot_id_raw = request.form.get("home_depot_id", "").strip()
+    if not display_name or not driver_number or not depot_id_raw.isdigit():
+        flash("Name, driver number and depot are required.")
+        return redirect(url_for("depot_access_dashboard"))
+    depot_id = int(depot_id_raw)
+    if depot_id not in permitted_depot_ids(manager):
+        abort(403)
+    try:
+        execute(
+            "UPDATE users SET display_name=?, driver_number=?, username=?, home_depot_id=? WHERE id=?",
+            (display_name, driver_number, driver_number, depot_id, user_id),
+        )
+        flash("Driver details updated.")
+    except sqlite3.IntegrityError:
+        flash("That driver number is already in use.")
+    return redirect(url_for("depot_access_dashboard"))
+
+
+@app.route("/depot-access/<int:user_id>/reset-password", methods=["POST"])
+@roles_required("depot", "admin")
+def depot_reset_driver_password(user_id):
+    depot_managed_driver(user_id)
+    password = request.form.get("password", "")
+    if len(password) < 6:
+        flash("Password must be at least 6 characters.")
+    else:
+        execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(password), user_id))
+        flash("Driver password reset.")
+    return redirect(url_for("depot_access_dashboard"))
+
+
+@app.route("/depot-access/<int:user_id>/toggle", methods=["POST"])
+@roles_required("depot", "admin")
+def depot_toggle_driver(user_id):
+    target = depot_managed_driver(user_id)
+    new_active = 0 if target["active"] else 1
+    new_status = "approved" if new_active else target["access_status"]
+    execute("UPDATE users SET active=?, access_status=? WHERE id=?", (new_active, new_status, user_id))
+    flash("Driver status updated.")
+    return redirect(url_for("depot_access_dashboard"))
+
+
+@app.route("/depot-access/<int:user_id>/delete", methods=["POST"])
+@roles_required("depot", "admin")
+def depot_delete_driver(user_id):
+    depot_managed_driver(user_id)
+    execute("DELETE FROM users WHERE id=?", (user_id,))
+    flash("Driver deleted. Existing request history is kept.")
+    return redirect(url_for("depot_access_dashboard"))
+
+
+@app.route("/admin/users/<int:user_id>/depots", methods=["POST"])
+@roles_required("admin")
+def admin_assign_user_depots(user_id):
+    target=query_one("SELECT id, COALESCE(access_role, role) AS effective_role FROM users WHERE id=?", (user_id,))
+    if not target or target["effective_role"] != "depot": abort(404)
+    depot_ids=[int(v) for v in request.form.getlist("depot_id") if v.isdigit()]
+    with closing(get_db()) as db:
+        db.execute("DELETE FROM user_depots WHERE user_id=?", (user_id,))
+        for depot_id in depot_ids:
+            db.execute("INSERT OR IGNORE INTO user_depots (user_id, depot_id) VALUES (?, ?)", (user_id, depot_id))
+        db.commit()
+    flash("Depot assignments updated.")
+    return redirect(url_for("admin_dashboard") + "#users")
+
+
+@app.route("/account/password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    user = current_user()
+    if request.method == "POST":
+        current_password = request.form.get("current_password", "")
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+        stored_user = query_one("SELECT password_hash FROM users WHERE id = ?", (user["id"],))
+
+        if not stored_user or not check_password_hash(stored_user["password_hash"], current_password):
+            flash("Current password is incorrect.")
+        elif len(new_password) < 6:
+            flash("New password must be at least 6 characters.")
+        elif new_password != confirm_password:
+            flash("New passwords do not match.")
+        elif check_password_hash(stored_user["password_hash"], new_password):
+            flash("New password must be different from your current password.")
+        else:
+            execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (generate_password_hash(new_password), user["id"]),
+            )
+            flash("Password changed successfully.")
+            return redirect(url_for("index"))
+
+    body = """
+    <section class="panel" style="max-width:560px; margin:0 auto;">
+      <div class="section-head">
+        <div>
+          <h1>Change password</h1>
+          <p class="muted">Update the password for {{ user.display_name }}.</p>
+        </div>
+      </div>
+      <form method="post" class="stack" autocomplete="off">
+        <div class="field">
+          <label for="current_password">Current password</label>
+          <input id="current_password" name="current_password" type="password" autocomplete="current-password" required autofocus>
+        </div>
+        <div class="field">
+          <label for="new_password">New password</label>
+          <input id="new_password" name="new_password" type="password" minlength="6" autocomplete="new-password" required>
+          <div class="small">At least 6 characters.</div>
+        </div>
+        <div class="field">
+          <label for="confirm_password">Confirm new password</label>
+          <input id="confirm_password" name="confirm_password" type="password" minlength="6" autocomplete="new-password" required>
+        </div>
+        <div class="split-actions">
+          <button class="btn" type="submit">Change password</button>
+          <a class="btn ghost" href="{{ url_for('index') }}">Cancel</a>
+        </div>
+      </form>
+    </section>
+    """
+    return render_page("Change password", body, user=user)
 
 
 @app.route("/logout")
@@ -1437,229 +1818,204 @@ def driver_home():
     redirect_response = require_shift_profile()
     if redirect_response:
         return redirect_response
-    driver_lists = driver_request_lists(current_user()["id"])
+    requests = driver_request_rows(current_user()["id"])
     body = """
-    <section class="hero">
+    <section class="hero driver-hero">
       <div>
-        <h1>Driver request board</h1>
+        <h1>Send Dispatch a note</h1>
         <p>{{ profile.driver_name }} · Truck {{ profile.truck_number }} · {{ profile.depot_name }}</p>
       </div>
-      <a class="btn ghost" href="{{ url_for('driver_profile') }}">Update shift details</a>
+      <div class="inline"><button id="driver-main-menu" class="btn ghost" type="button">Main Menu</button><a class="btn ghost" href="{{ url_for('driver_profile') }}">Shift details</a></div>
     </section>
-    <div class="grid two">
-      <section class="panel">
-        <h2>Send Dispatch a request</h2>
+    <div class="grid two driver-layout">
+      <section class="panel driver-send-panel">
         <form id="request-form" method="post" action="{{ url_for('create_driver_request') }}">
           <input id="request_type_id" name="request_type_id" type="hidden" required>
-          <div id="request-buttons" class="request-buttons">
-            {% for item in request_types %}
-              <button class="btn request-choice" data-request-id="{{ item.id }}" style="background: {{ item.button_color }};" type="button">{{ item.label }}</button>
-            {% endfor %}
-          </div>
-          <div id="request-detail-panel" class="item" style="margin-top: 14px; display: none;">
-            <h3 id="selected-request-title">Request details</h3>
-            <div id="dynamic-fields"></div>
-            <div class="field">
-              <label id="note-label" for="note">Optional note</label>
-              <textarea id="note" name="note" placeholder="Add context if needed"></textarea>
+          <div id="request-picker">
+            <h2>What do you need?</h2>
+            <div id="request-buttons" class="request-buttons">
+              {% for item in request_types %}
+                <button class="btn request-choice" data-request-id="{{ item.id }}" style="background: {{ item.button_color }};" type="button">{{ item.label }}</button>
+              {% endfor %}
             </div>
-            <button id="request-back-button" class="btn ghost full" type="button" style="margin-bottom: 8px;">Back to request buttons</button>
-            <button id="send-request-button" class="btn full" type="submit" disabled>Send request</button>
           </div>
+          <div id="flow-panel" class="driver-flow" hidden>
+            <div class="flow-topline">
+              <button id="flow-back" class="btn ghost compact" type="button">Back</button>
+              <span id="flow-progress" class="chip"></span>
+            </div>
+            <h2 id="flow-title"></h2>
+            <div id="flow-question"></div>
+            <div id="flow-review" hidden></div>
+            <div id="flow-actions" class="flow-actions"></div>
+          </div>
+          <div id="send-state" class="send-state" hidden aria-live="polite"></div>
         </form>
       </section>
-      <section class="panel">
+      <section class="panel driver-history-panel">
         <div class="inline" style="justify-content: space-between; margin-bottom: 10px;">
-          <h2 style="margin: 0;">Your requests</h2>
+          <h2 style="margin: 0;">Recent notes</h2>
           <span class="small" id="last-updated">Live</span>
         </div>
-        <div id="driver-requests" class="list">
-          {% with requests=active_requests %}
-            {% include 'driver_request_active_items' %}
-          {% endwith %}
-        </div>
-        <details style="margin-top: 14px;">
-          <summary style="cursor: pointer; font-weight: 900;">Old requests</summary>
-          <div id="driver-request-history" class="list" style="margin-top: 10px;">
-            {% with requests=history_requests %}
-              {% include 'driver_request_history_items' %}
-            {% endwith %}
-          </div>
-        </details>
+        <div id="driver-requests" class="list">{% include 'driver_request_items' %}</div>
       </section>
     </div>
     <script>
-      async function refreshDriverRequests() {
-        const response = await fetch("{{ url_for('driver_requests_api') }}", { headers: { "Accept": "application/json" } });
-        if (!response.ok) return;
-        const data = await response.json();
-        const wrap = document.getElementById("driver-requests");
-        const historyWrap = document.getElementById("driver-request-history");
-        wrap.innerHTML = renderActiveRequests(data.active_requests);
-        historyWrap.innerHTML = renderHistoryRequests(data.history_requests);
-        bindDismissGestures();
-        document.getElementById("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
-      }
-      function renderActiveRequests(requests) {
-        return requests.map((item) => `
-          <article class="item">
-            <div class="item-head">
-              <strong>${escapeHtml(item.request_type_label)}</strong>
-              <span class="status ${item.driver_status_class}">${escapeHtml(item.driver_status_label)}</span>
-            </div>
-            <div class="meta">${escapeHtml(item.created_at)} · ${escapeHtml(item.depot_name)} · Truck ${escapeHtml(item.truck_number)}</div>
-            ${renderDetails(item.details)}
-            ${item.note ? `<p style="margin-top: 8px;">${escapeHtml(item.note)}</p>` : ""}
-            ${item.comments.map((comment) => `<div class="comment"><strong>${escapeHtml(comment.author_name)}</strong><div>${escapeHtml(comment.body)}</div><div class="meta">${escapeHtml(comment.created_at)}</div></div>`).join("")}
-            <form method="post" action="/driver/request/${item.id}/dismiss" style="margin-top: 8px;">
-              <button class="btn ghost" type="submit">Dismiss</button>
-            </form>
-          </article>
-        `).join("") || `<div class="item"><p>No active requests.</p></div>`;
-      }
-      function renderHistoryRequests(requests) {
-        return requests.map((item) => `
-          <details class="item driver-dismissible">
-            <summary style="cursor: pointer;">
-              <div class="item-head" style="display: inline-flex; width: calc(100% - 20px);">
-                <strong>${escapeHtml(item.request_type_label)}</strong>
-              </div>
-              <div class="meta">${escapeHtml(item.created_at)} · ${escapeHtml(item.depot_name)} · Truck ${escapeHtml(item.truck_number)}</div>
-            </summary>
-            <div style="margin-top: 8px;">
-              ${item.supply_number ? `<div class="meta"><strong>Supply No:</strong> ${escapeHtml(item.supply_number)}</div>` : ""}
-              ${renderDetails(item.details)}
-              ${item.note ? `<p style="margin-top: 8px;">${escapeHtml(item.note)}</p>` : ""}
-              ${item.comments.map((comment) => `<div class="comment"><strong>${escapeHtml(comment.author_name)}</strong><div>${escapeHtml(comment.body)}</div><div class="meta">${escapeHtml(comment.created_at)}</div></div>`).join("")}
-              <form method="post" action="/driver/request/${item.id}/dismiss" style="margin-top: 8px;">
-                <button class="btn ghost" type="submit">Dismiss</button>
-              </form>
-            </div>
-          </details>
-        `).join("") || `<div class="item"><p>No old requests.</p></div>`;
-      }
       function escapeHtml(value) {
         return String(value || "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char]));
       }
       function renderDetails(details) {
         if (!details || !details.length) return "";
-        return `<div class="meta" style="margin-top: 8px;">${details.map((detail) => detail.label ? `<strong>${escapeHtml(detail.label)}:</strong> ${escapeHtml(detail.value)}` : escapeHtml(detail.value)).join("<br>")}</div>`;
+        return `<div class="meta" style="margin-top:8px;">${details.map((detail) => `<strong>${escapeHtml(detail.label)}:</strong> ${escapeHtml(detail.value)}`).join("<br>")}</div>`;
       }
+      async function refreshDriverRequests() {
+        try {
+          const response = await fetch("{{ url_for('driver_requests_api') }}", { headers: { "Accept": "application/json" } });
+          if (!response.ok) return;
+          const data = await response.json();
+          document.getElementById("driver-requests").innerHTML = data.requests.map((item) => `
+            <article class="item"><div class="item-head"><strong>${escapeHtml(item.request_type_label)}</strong><span class="status ${item.driver_status_class}">${escapeHtml(item.driver_status_label)}</span></div>
+            <div class="meta">${escapeHtml(item.created_at)} · ${escapeHtml(item.depot_name)} · Truck ${escapeHtml(item.truck_number)}</div>${renderDetails(item.details)}
+            ${item.note ? `<p style="margin-top:8px;">${escapeHtml(item.note)}</p>` : ""}
+            ${item.comments.map((comment) => `<div class="comment"><strong>${escapeHtml(comment.author_name)}</strong><div>${escapeHtml(comment.body)}</div><div class="meta">${escapeHtml(comment.created_at)}</div></div>`).join("")}</article>`).join("") || `<div class="item"><p>No requests yet.</p></div>`;
+          document.getElementById("last-updated").textContent = "Updated " + new Date().toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+        } catch (_) {}
+      }
+
       const requestTypes = {{ request_types_json|tojson }};
+      const form = document.getElementById("request-form");
+      const picker = document.getElementById("request-picker");
+      const flowPanel = document.getElementById("flow-panel");
+      const flowTitle = document.getElementById("flow-title");
+      const flowQuestion = document.getElementById("flow-question");
+      const flowReview = document.getElementById("flow-review");
+      const flowActions = document.getElementById("flow-actions");
+      const flowProgress = document.getElementById("flow-progress");
+      const flowBack = document.getElementById("flow-back");
+      const sendState = document.getElementById("send-state");
       const requestInput = document.getElementById("request_type_id");
-      const requestButtons = document.getElementById("request-buttons");
-      const detailPanel = document.getElementById("request-detail-panel");
-      const dynamicFields = document.getElementById("dynamic-fields");
-      const note = document.getElementById("note");
-      const noteLabel = document.getElementById("note-label");
-      const sendButton = document.getElementById("send-request-button");
-      const backButton = document.getElementById("request-back-button");
-      const title = document.getElementById("selected-request-title");
-      document.querySelectorAll(".request-choice").forEach((button) => {
-        button.addEventListener("click", () => selectRequest(button.dataset.requestId));
-      });
-      backButton.addEventListener("click", () => {
-        requestInput.value = "";
-        dynamicFields.innerHTML = "";
-        note.value = "";
-        note.required = false;
-        requestButtons.style.display = "grid";
-        detailPanel.style.display = "none";
-        sendButton.disabled = true;
-        document.querySelectorAll(".request-choice").forEach((button) => button.classList.remove("secondary"));
-      });
-      function selectRequest(id) {
-        const requestType = requestTypes.find((item) => String(item.id) === String(id));
-        if (!requestType) return;
-        requestInput.value = requestType.id;
-        title.textContent = requestType.label;
-        document.querySelectorAll(".request-choice").forEach((button) => {
-          button.classList.toggle("secondary", String(button.dataset.requestId) === String(id));
-        });
-        renderDynamicFields(requestType.form_schema || {});
-        const schema = requestType.form_schema || {};
-        noteLabel.textContent = schema.note_label || "Optional note";
-        note.placeholder = schema.note_placeholder || "Add context if needed";
-        note.required = Boolean(schema.note_required);
-        note.value = "";
-        requestButtons.style.display = "none";
-        detailPanel.style.display = "block";
-        sendButton.disabled = false;
+      const driverMainMenu = document.getElementById("driver-main-menu");
+      let returnTimer = null;
+      let selectedType = null;
+      let visibleFields = [];
+      let step = 0;
+      let answers = {};
+      let submitting = false;
+
+      function fieldVisible(field) {
+        const condition = field.show_when;
+        if (!condition) return true;
+        return answers[condition.field] === condition.equals;
       }
-      function renderDynamicFields(schema) {
-        const fields = schema.fields || [];
-        dynamicFields.innerHTML = fields.map(renderField).join("");
-        dynamicFields.querySelectorAll("select").forEach((select) => {
-          select.addEventListener("change", updateConditionalFields);
-        });
-        dynamicFields.querySelectorAll(".choice-tile").forEach((button) => {
-          button.addEventListener("click", () => {
-            const input = dynamicFields.querySelector(`[name="${button.dataset.inputName}"]`);
-            if (!input) return;
-            input.value = button.dataset.value;
-            button.parentElement.querySelectorAll(".choice-tile").forEach((tile) => {
-              tile.classList.toggle("selected", tile === button);
-            });
-            updateConditionalFields();
-          });
-        });
-        updateConditionalFields();
+      function refreshVisibleFields() {
+        visibleFields = ((selectedType && selectedType.form_schema && selectedType.form_schema.fields) || []).filter(fieldVisible);
+        if (step > visibleFields.length) step = visibleFields.length;
       }
-      function renderField(field) {
-        const required = field.required ? "required" : "";
-        const condition = field.show_when ? `data-show-field="${escapeHtml(field.show_when.field)}" data-show-equals="${escapeHtml(field.show_when.equals)}"` : "";
-        if (field.type === "choice") {
-          return `<div class="field" ${condition}>
-            <label>${escapeHtml(field.label)}</label>
-            <input type="hidden" id="detail_${escapeHtml(field.name)}" name="detail_${escapeHtml(field.name)}" ${required}>
-            <div class="choice-tiles">
-              ${(field.choices || []).map((choice) => `<button class="choice-tile" type="button" data-input-name="detail_${escapeHtml(field.name)}" data-value="${escapeHtml(choice)}">${escapeHtml(choice)}</button>`).join("")}
-            </div>
-          </div>`;
+      function startFlow(id) {
+        selectedType = requestTypes.find((item) => String(item.id) === String(id));
+        if (!selectedType) return;
+        requestInput.value = selectedType.id;
+        answers = {};
+        step = 0;
+        picker.hidden = true;
+        flowPanel.hidden = false;
+        sendState.hidden = true;
+        flowTitle.textContent = selectedType.label;
+        refreshVisibleFields();
+        renderStep();
+      }
+      function resetFlow() {
+        if (returnTimer) { window.clearInterval(returnTimer); returnTimer = null; }
+        selectedType = null; answers = {}; step = 0; submitting = false;
+        requestInput.value = ""; flowPanel.hidden = true; sendState.hidden = true; picker.hidden = false;
+        form.querySelectorAll('input[data-generated="true"], textarea[data-generated="true"]').forEach((el) => el.remove());
+      }
+      function goBack() {
+        if (step <= 0) return resetFlow();
+        step -= 1; renderStep();
+      }
+      function choose(field, value) {
+        answers[field.name] = value;
+        refreshVisibleFields();
+        window.setTimeout(() => { step += 1; renderStep(); }, 90);
+      }
+      function saveTyped(field) {
+        const input = document.getElementById("active-answer");
+        const value = (input.value || "").trim();
+        if (field.required && !value) { input.focus(); input.classList.add("input-error"); return; }
+        answers[field.name] = value;
+        refreshVisibleFields(); step += 1; renderStep();
+      }
+      function renderStep() {
+        refreshVisibleFields();
+        flowQuestion.innerHTML = ""; flowReview.hidden = true; flowActions.innerHTML = "";
+        flowBack.textContent = step === 0 ? "All options" : "Back";
+        if (step >= visibleFields.length) return renderReview();
+        const field = visibleFields[step];
+        flowProgress.textContent = `Question ${step + 1} of ${visibleFields.length}`;
+        const requiredMark = field.required ? "" : '<span class="small">Optional</span>';
+        flowQuestion.innerHTML = `<div class="driver-question"><div class="question-heading"><h3>${escapeHtml(field.label)}</h3>${requiredMark}</div><div id="answer-area"></div></div>`;
+        const area = document.getElementById("answer-area");
+        if (field.type === "choice" || field.type === "yes_no") {
+          const choices = field.type === "yes_no" ? ["Yes", "No"] : (field.choices || []);
+          area.innerHTML = `<div class="driver-answer-buttons">${choices.map((choice) => `<button type="button" class="driver-answer ${answers[field.name] === choice ? "selected" : ""}" data-value="${escapeHtml(choice)}">${escapeHtml(choice)}</button>`).join("")}</div>`;
+          area.querySelectorAll(".driver-answer").forEach((button) => button.addEventListener("click", () => choose(field, button.dataset.value)));
+          if (!field.required) flowActions.innerHTML = '<button class="btn ghost full" type="button" id="skip-answer">Skip</button>';
+          document.getElementById("skip-answer")?.addEventListener("click", () => choose(field, ""));
+        } else {
+          const inputType = field.type === "number" ? "number" : "text";
+          const multiline = field.type === "note";
+          area.innerHTML = multiline ? `<textarea id="active-answer" rows="4" placeholder="Type a short note">${escapeHtml(answers[field.name] || "")}</textarea>` : `<input id="active-answer" type="${inputType}" value="${escapeHtml(answers[field.name] || "")}" autocomplete="off">`;
+          flowActions.innerHTML = '<button class="btn full driver-next" type="button">Continue</button>';
+          flowActions.querySelector("button").addEventListener("click", () => saveTyped(field));
+          document.getElementById("active-answer").addEventListener("keydown", (event) => { if (event.key === "Enter" && !multiline) { event.preventDefault(); saveTyped(field); }});
+          document.getElementById("active-answer").focus();
         }
-        return `<div class="field" ${condition}>
-          <label for="detail_${escapeHtml(field.name)}">${escapeHtml(field.label)}</label>
-          <input id="detail_${escapeHtml(field.name)}" name="detail_${escapeHtml(field.name)}" ${required}>
-        </div>`;
       }
-      function updateConditionalFields() {
-        dynamicFields.querySelectorAll("[data-show-field]").forEach((wrapper) => {
-          const controller = dynamicFields.querySelector(`[name="detail_${wrapper.dataset.showField}"]`);
-          const visible = controller && controller.value === wrapper.dataset.showEquals;
-          wrapper.style.display = visible ? "block" : "none";
-          wrapper.querySelectorAll("input, select, textarea").forEach((control) => {
-            control.disabled = !visible;
-          });
-        });
+      function renderReview() {
+        flowProgress.textContent = "Review";
+        flowReview.hidden = false;
+        const rows = visibleFields.filter((field) => answers[field.name]).map((field) => `<div class="review-row"><span>${escapeHtml(field.label)}</span><strong>${escapeHtml(answers[field.name])}</strong></div>`).join("");
+        const schema = selectedType.form_schema || {};
+        flowReview.innerHTML = `<div class="review-card">${rows || '<p>No extra details required.</p>'}<div class="field" style="margin-top:14px;"><label for="review-note">${escapeHtml(schema.note_label || "Optional note")}</label><textarea id="review-note" placeholder="${escapeHtml(schema.note_placeholder || "Add context if needed")}" ${schema.note_required ? "required" : ""}></textarea></div></div>`;
+        flowActions.innerHTML = '<button id="send-flow" class="btn full driver-send" type="button">Send to Dispatch</button>';
+        document.getElementById("send-flow").addEventListener("click", submitFlow);
       }
-      function bindDismissGestures() {
-        document.querySelectorAll(".driver-dismissible").forEach((item) => {
-          let startX = 0;
-          item.addEventListener("touchstart", (event) => {
-            startX = event.touches[0].clientX;
-          }, { passive: true });
-          item.addEventListener("touchend", (event) => {
-            const endX = event.changedTouches[0].clientX;
-            if (startX - endX > 90) {
-              const form = item.querySelector("form");
-              if (form) form.requestSubmit();
-            }
-          });
-        });
+      async function submitFlow() {
+        if (submitting) return;
+        const schema = selectedType.form_schema || {};
+        const reviewNote = document.getElementById("review-note");
+        if (schema.note_required && !reviewNote.value.trim()) { reviewNote.focus(); return; }
+        submitting = true;
+        const button = document.getElementById("send-flow"); button.disabled = true; button.textContent = "Sending…";
+        const payload = new FormData(); payload.set("request_type_id", selectedType.id); payload.set("note", reviewNote.value.trim());
+        visibleFields.forEach((field) => payload.set(`detail_${field.name}`, answers[field.name] || ""));
+        try {
+          const response = await fetch(form.action, { method: "POST", body: payload, headers: {"X-Requested-With":"fetch"} });
+          if (!response.ok) throw new Error("send failed");
+          flowPanel.hidden = true; sendState.hidden = false;
+          let seconds = 5;
+          sendState.innerHTML = `<div class="success-mark">✓</div><h2>Sent to Dispatch</h2><p>${escapeHtml(selectedType.label)}</p><button class="btn full" type="button" id="send-another">Main Menu (${seconds})</button>`;
+          const mainButton = document.getElementById("send-another");
+          mainButton.addEventListener("click", resetFlow);
+          returnTimer = window.setInterval(() => {
+            seconds -= 1;
+            if (seconds <= 0) { resetFlow(); return; }
+            mainButton.textContent = `Main Menu (${seconds})`;
+          }, 1000);
+          await refreshDriverRequests();
+        } catch (_) {
+          submitting = false; button.disabled = false; button.textContent = "Try again";
+          sendState.hidden = false; sendState.innerHTML = '<div class="error-message">Could not send. Check the connection and try again.</div>';
+        }
       }
-      bindDismissGestures();
+      document.querySelectorAll(".request-choice").forEach((button) => button.addEventListener("click", () => startFlow(button.dataset.requestId)));
+      flowBack.addEventListener("click", goBack);
+      driverMainMenu.addEventListener("click", resetFlow);
       setInterval(refreshDriverRequests, 5000);
     </script>
     """
-    return render_page(
-        "Driver",
-        body,
-        profile=session["shift_profile"],
-        request_types=request_type_cards(),
-        request_types_json=request_type_cards(),
-        active_requests=driver_lists["active_requests"],
-        history_requests=driver_lists["history_requests"],
-    )
+    return render_page("Driver", body, profile=session["shift_profile"], request_types=request_type_cards(), request_types_json=request_type_cards(), requests=requests)
 
 
 app.jinja_loader = ChoiceLoader(
@@ -1667,7 +2023,7 @@ app.jinja_loader = ChoiceLoader(
         app.jinja_loader,
         DictLoader(
             {
-                "driver_request_active_items": """
+                "driver_request_items": """
       {% for item in requests %}
         <article class="item">
           <div class="item-head">
@@ -1678,7 +2034,7 @@ app.jinja_loader = ChoiceLoader(
           {% if item.details %}
             <div class="meta" style="margin-top: 8px;">
               {% for detail in item.details %}
-                {% if detail.label %}<strong>{{ detail.label }}:</strong> {% endif %}{{ detail.value }}{% if not loop.last %}<br>{% endif %}
+                <strong>{{ detail.label }}:</strong> {{ detail.value }}{% if not loop.last %}<br>{% endif %}
               {% endfor %}
             </div>
           {% endif %}
@@ -1690,49 +2046,9 @@ app.jinja_loader = ChoiceLoader(
               <div class="meta">{{ comment.created_at }}</div>
             </div>
           {% endfor %}
-          <form method="post" action="{{ url_for('dismiss_driver_request', request_id=item.id) }}" style="margin-top: 8px;">
-            <button class="btn ghost" type="submit">Dismiss</button>
-          </form>
         </article>
       {% else %}
-        <div class="item"><p>No active requests.</p></div>
-      {% endfor %}
-    """,
-                "driver_request_history_items": """
-      {% for item in requests %}
-        <details class="item driver-dismissible">
-          <summary style="cursor: pointer;">
-            <div class="item-head" style="display: inline-flex; width: calc(100% - 20px);">
-              <strong>{{ item.request_type_label }}</strong>
-            </div>
-            <div class="meta">{{ item.created_at }} · {{ item.depot_name }} · Truck {{ item.truck_number }}</div>
-          </summary>
-          <div style="margin-top: 8px;">
-            {% if item.supply_number %}
-              <div class="meta"><strong>Supply No:</strong> {{ item.supply_number }}</div>
-            {% endif %}
-            {% if item.details %}
-              <div class="meta" style="margin-top: 8px;">
-                {% for detail in item.details %}
-                  {% if detail.label %}<strong>{{ detail.label }}:</strong> {% endif %}{{ detail.value }}{% if not loop.last %}<br>{% endif %}
-                {% endfor %}
-              </div>
-            {% endif %}
-            {% if item.note %}<p style="margin-top: 8px;">{{ item.note }}</p>{% endif %}
-            {% for comment in item.comments %}
-              <div class="comment">
-                <strong>{{ comment.author_name }}</strong>
-                <div>{{ comment.body }}</div>
-                <div class="meta">{{ comment.created_at }}</div>
-              </div>
-            {% endfor %}
-            <form method="post" action="{{ url_for('dismiss_driver_request', request_id=item.id) }}" style="margin-top: 8px;">
-              <button class="btn ghost" type="submit">Dismiss</button>
-            </form>
-          </div>
-        </details>
-      {% else %}
-        <div class="item"><p>No old requests.</p></div>
+        <div class="item"><p>No requests yet.</p></div>
       {% endfor %}
     """
             }
@@ -1793,12 +2109,12 @@ def create_driver_request():
     return redirect(url_for("driver_home"))
 
 
-def load_driver_request_rows(user_id):
+def driver_request_rows(user_id):
     rows = query_all(
         """
         SELECT *
         FROM driver_requests
-        WHERE driver_user_id = ? AND driver_hidden_at IS NULL
+        WHERE driver_user_id = ?
         ORDER BY
           CASE status WHEN 'new' THEN 1 WHEN 'acknowledged' THEN 2 ELSE 3 END,
           created_at DESC
@@ -1824,45 +2140,10 @@ def load_driver_request_rows(user_id):
     return requests
 
 
-def driver_request_lists(user_id):
-    requests = load_driver_request_rows(user_id)
-    return {
-        "active_requests": [item for item in requests if item["driver_bucket"] == "active"],
-        "history_requests": [item for item in requests if item["driver_bucket"] == "history"],
-    }
-
-
-def driver_request_rows(user_id):
-    lists = driver_request_lists(user_id)
-    return lists["active_requests"] + lists["history_requests"]
-
-
 @app.route("/api/driver/requests")
 @roles_required("driver")
 def driver_requests_api():
-    lists = driver_request_lists(current_user()["id"])
-    return jsonify({
-        "requests": lists["active_requests"] + lists["history_requests"],
-        "active_requests": lists["active_requests"],
-        "history_requests": lists["history_requests"],
-    })
-
-
-@app.route("/driver/request/<int:request_id>/dismiss", methods=["POST"])
-@roles_required("driver")
-def dismiss_driver_request(request_id):
-    item = query_one(
-        "SELECT id FROM driver_requests WHERE id = ? AND driver_user_id = ?",
-        (request_id, current_user()["id"]),
-    )
-    if not item:
-        abort(404)
-    execute(
-        "UPDATE driver_requests SET driver_hidden_at = ? WHERE id = ?",
-        (now_iso(), request_id),
-    )
-    flash("Request dismissed from your view.")
-    return redirect(url_for("driver_home"))
+    return jsonify({"requests": driver_request_rows(current_user()["id"])})
 
 
 def dispatch_request_rows(filters):
@@ -2656,211 +2937,169 @@ def complete_request(request_id):
 @app.route("/admin")
 @roles_required("admin")
 def admin_dashboard():
-    users = query_all("SELECT * FROM users ORDER BY active DESC, role, display_name")
+    users = [dict(row) for row in query_all("""
+        SELECT u.*, COALESCE(u.access_role, u.role) AS effective_role,
+               d.name AS home_depot_name
+        FROM users u
+        LEFT JOIN depots d ON d.id = u.home_depot_id
+        ORDER BY u.active DESC, effective_role, COALESCE(d.name, ''), u.display_name
+    """)]
+    for item in users:
+        item["depot_ids"] = [row["depot_id"] for row in query_all("SELECT depot_id FROM user_depots WHERE user_id = ?", (item["id"],))]
+    pending_rows = query_all("""
+        SELECT home_depot_id, COUNT(*) AS pending_count
+        FROM users
+        WHERE COALESCE(access_role, role) = 'driver' AND access_status = 'pending'
+        GROUP BY home_depot_id
+    """)
+    pending_by_depot = {row["home_depot_id"]: row["pending_count"] for row in pending_rows}
+    total_pending = sum(pending_by_depot.values())
     categorized_body = """
     <section class="hero">
       <div>
         <h1>Admin</h1>
-        <p>Configure people, driver flows, dashboard queues, desk profiles, and depot routing.</p>
+        <p>Manage people, driver flows, dispatcher desks, queues and depot routing.</p>
       </div>
     </section>
-    <details id="users" class="panel admin-section">
-      <summary>Users</summary>
-      <form method="post" action="{{ url_for('admin_create_user') }}" class="grid three">
-        <div class="field"><label>Username</label><input name="username" required></div>
-        <div class="field"><label>Display name</label><input name="display_name" required></div>
-        <div class="field">
-          <label>Role</label>
-          <select name="role">
-            <option value="driver">Driver</option>
-            <option value="dispatch">Dispatch</option>
-            <option value="admin">Admin</option>
-          </select>
-        </div>
-        <div class="field"><label>Temporary password</label><input name="password" required></div>
-        <div class="field" style="align-self: end;"><button class="btn" type="submit">Create user</button></div>
-      </form>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
-          <tbody>
-          {% for item in users %}
-            <tr>
-              <td>
-                <form id="user-save-{{ item.id }}" method="post" action="{{ url_for('admin_update_user', user_id=item.id) }}"></form>
-                <input form="user-save-{{ item.id }}" name="username" value="{{ item.username }}" required style="margin-bottom: 6px;">
-                <input form="user-save-{{ item.id }}" name="display_name" value="{{ item.display_name }}" required>
-              </td>
-              <td>
-                <select form="user-save-{{ item.id }}" name="role">
-                  {% for role in ['driver', 'dispatch', 'admin'] %}
-                    <option value="{{ role }}" {% if item.role == role %}selected{% endif %}>{{ role|title }}</option>
-                  {% endfor %}
-                </select>
-              </td>
-              <td>{{ 'Active' if item.active else 'Disabled' }}</td>
-              <td>
-                <div class="split-actions">
-                  <button class="btn secondary" form="user-save-{{ item.id }}" type="submit">Save</button>
-                  <form method="post" action="{{ url_for('admin_reset_password', user_id=item.id) }}" class="inline">
-                    <input name="password" placeholder="New password" required style="width: 150px;">
-                    <button class="btn amber" type="submit">Reset</button>
-                  </form>
-                  <form method="post" action="{{ url_for('admin_toggle_user', user_id=item.id) }}">
-                    <button class="btn ghost" type="submit">{{ 'Disable' if item.active else 'Enable' }}</button>
-                  </form>
-                  <form method="post" action="{{ url_for('admin_delete_user', user_id=item.id) }}" onsubmit="return confirm('Delete this user? Existing request history will remain.');">
-                    <button class="btn red" type="submit">Delete</button>
-                  </form>
-                </div>
-              </td>
-            </tr>
+
+    {% if total_pending %}
+      <section class="panel" style="border-color:#fed7aa;background:#fffaf5;">
+        <h2 style="margin-bottom:6px;">Pending driver approvals <span class="status-badge pending">{{ total_pending }}</span></h2>
+        <div class="pending-overview">
+          {% for depot in depots_all if pending_by_depot.get(depot.id, 0) %}
+            <a class="pending-link" href="#admin-driver-depot-{{ depot.id }}"><span>{{ depot.name }}</span><span class="pending-count">{{ pending_by_depot.get(depot.id, 0) }}</span></a>
           {% endfor %}
-          </tbody>
-        </table>
-      </div>
+          {% if pending_by_depot.get(None, 0) %}<span class="pending-link">Unassigned depot <span class="pending-count">{{ pending_by_depot.get(None, 0) }}</span></span>{% endif %}
+        </div>
+      </section>
+    {% endif %}
+
+    <details id="users" class="panel admin-section" open>
+      <summary>Users <span class="small">{{ users|length }}</span></summary>
+      <details class="admin-create">
+        <summary class="btn secondary compact" style="width:max-content;">Add user</summary>
+        <form method="post" action="{{ url_for('admin_create_user') }}" class="grid three" style="margin-top:12px;">
+          <div class="field"><label>Username</label><input name="username" required></div>
+          <div class="field"><label>Display name</label><input name="display_name" required></div>
+          <div class="field"><label>Role</label><select name="role"><option value="driver">Driver</option><option value="dispatch">Dispatch</option><option value="depot">Depot</option><option value="admin">Admin</option></select></div>
+          <div class="field"><label>Temporary password</label><input name="password" required></div>
+          <div class="field" style="align-self:end;"><button class="btn" type="submit">Create user</button></div>
+        </form>
+      </details>
+      {% macro user_record(item) %}
+        <details class="compact-record">
+          <summary>
+            <span class="record-title"><strong>{{ item.display_name }}</strong><span>{{ item.username }}</span></span>
+            <span>{{ item.home_depot_name or item.effective_role|title }}</span>
+            <span class="status-badge {{ 'active' if item.active else ('pending' if item.access_status == 'pending' else 'inactive') }}">{{ 'Active' if item.active else ('Pending' if item.access_status == 'pending' else 'Inactive') }}</span>
+          </summary>
+          <div class="record-body">
+            <form id="user-save-{{ item.id }}" method="post" action="{{ url_for('admin_update_user', user_id=item.id) }}" class="grid three">
+              <div class="field"><label>Username / driver number</label><input name="username" value="{{ item.username }}" required></div>
+              <div class="field"><label>Display name</label><input name="display_name" value="{{ item.display_name }}" required></div>
+              <div class="field"><label>Role</label><select name="role">{% for role in ['driver','dispatch','depot','admin'] %}<option value="{{ role }}" {% if item.effective_role == role %}selected{% endif %}>{{ role|title }}</option>{% endfor %}</select></div>
+            </form>
+            {% if item.effective_role == 'depot' %}
+              <details style="margin-top:12px;">
+                <summary class="btn ghost compact" style="width:max-content;">Assigned depots ({{ item.depot_ids|length }})</summary>
+                <form method="post" action="{{ url_for('admin_assign_user_depots', user_id=item.id) }}" style="margin-top:10px;">
+                  <div class="choice-tiles">{% for depot in depots_all %}<label class="chip"><input type="checkbox" name="depot_id" value="{{ depot.id }}" style="width:auto;min-height:0;" {% if depot.id in item.depot_ids %}checked{% endif %}> {{ depot.name }}</label>{% endfor %}</div>
+                  <button class="btn secondary compact" type="submit" style="margin-top:10px;">Save depot access</button>
+                </form>
+              </details>
+            {% endif %}
+            <div class="record-actions">
+              <button class="btn secondary" form="user-save-{{ item.id }}" type="submit">Save details</button>
+              <details><summary class="btn amber" style="list-style:none;">Reset password</summary><form method="post" action="{{ url_for('admin_reset_password', user_id=item.id) }}" class="inline" style="margin-top:8px;"><input name="password" placeholder="New password" required style="width:180px;"><button class="btn amber" type="submit">Apply</button></form></details>
+              <form method="post" action="{{ url_for('admin_toggle_user', user_id=item.id) }}"><button class="btn ghost" type="submit">{{ 'Make inactive' if item.active else 'Make active' }}</button></form>
+              <form method="post" action="{{ url_for('admin_delete_user', user_id=item.id) }}" onsubmit="return confirm('Delete this user? Existing request history will remain.');"><button class="btn red" type="submit">Delete</button></form>
+            </div>
+          </div>
+        </details>
+      {% endmacro %}
+
+      {% for role_key, role_label in [('admin','Admins'), ('dispatch','Dispatch'), ('depot','Depot users')] %}
+        {% set role_users = users|selectattr('effective_role', 'equalto', role_key)|list %}
+        <details class="user-role-group" {% if role_key == 'admin' %}open{% endif %}>
+          <summary>{{ role_label }} <span class="small">{{ role_users|length }}</span></summary>
+          {% if role_users %}{% for item in role_users %}{{ user_record(item) }}{% endfor %}{% else %}<p class="small empty-group">No {{ role_label|lower }}.</p>{% endif %}
+        </details>
+      {% endfor %}
+
+      {% set drivers = users|selectattr('effective_role', 'equalto', 'driver')|list %}
+      <details class="user-role-group" open>
+        <summary>Drivers <span class="small">{{ drivers|length }}</span></summary>
+        {% for depot in depots_all %}
+          {% set depot_drivers = drivers|selectattr('home_depot_id', 'equalto', depot.id)|list %}
+          {% if depot_drivers %}
+            <details id="admin-driver-depot-{{ depot.id }}" class="driver-depot-group" {% if pending_by_depot.get(depot.id, 0) %}open{% endif %}>
+              <summary><span>{{ depot.name }}</span><span class="small">{{ depot_drivers|length }}</span>{% if pending_by_depot.get(depot.id, 0) %}<span class="status-badge pending">{{ pending_by_depot.get(depot.id, 0) }} pending</span>{% endif %}</summary>
+              {% for item in depot_drivers %}{{ user_record(item) }}{% endfor %}
+            </details>
+          {% endif %}
+        {% endfor %}
+        {% set unassigned_drivers = drivers|selectattr('home_depot_id', 'none')|list %}
+        {% if unassigned_drivers %}
+          <details class="driver-depot-group">
+            <summary>Unassigned depot <span class="small">{{ unassigned_drivers|length }}</span></summary>
+            {% for item in unassigned_drivers %}{{ user_record(item) }}{% endfor %}
+          </details>
+        {% endif %}
+        {% if not drivers %}<p class="small empty-group">No drivers.</p>{% endif %}
+      </details>
     </details>
 
     <details id="driver-flows" class="panel admin-section" open>
-      <summary>Driver flows</summary>
-      <p>Use color to make common driver buttons instantly recognisable. Receipt mode controls what comes back to the driver.</p>
-      <form method="post" action="{{ url_for('admin_create_request_type') }}" class="grid three">
-        <div class="field"><label>Button label</label><input name="label" required></div>
-        <div class="field"><label>Color</label><input name="button_color" type="color" value="#2563eb"></div>
-        <div class="field"><label>Sort</label><input name="sort_order" type="number" value="100"></div>
-        <div class="field">
-          <label>Driver receipt</label>
-          <select name="receipt_mode">
-            <option value="none">No driver receipt</option>
-            <option value="ack_only">Acknowledge only</option>
-            <option value="ack_done">Acknowledge + done</option>
-          </select>
-        </div>
-        <div class="field" style="align-self: end;"><button class="btn" type="submit">Add flow button</button></div>
-      </form>
-      <div class="flow-tile-grid">
-        {% for item in request_types %}
-          <a class="flow-preview" href="{{ url_for('admin_edit_request_type', type_id=item.id) }}" style="background: {{ item.button_color }};">{{ item.label }}</a>
-        {% endfor %}
-      </div>
+      <summary>Driver flows <span class="small">{{ request_types|length }}</span></summary>
+      <details class="admin-create"><summary class="btn secondary compact" style="width:max-content;">Add driver flow</summary>
+        <form method="post" action="{{ url_for('admin_create_request_type') }}" class="grid three" style="margin-top:12px;">
+          <div class="field"><label>Button label</label><input name="label" required></div><div class="field"><label>Colour</label><input name="button_color" type="color" value="#2563eb"></div><div class="field"><label>Sort</label><input name="sort_order" type="number" value="100"></div>
+          <div class="field"><label>Driver receipt</label><select name="receipt_mode"><option value="none">No driver receipt</option><option value="ack_only">Acknowledge only</option><option value="ack_done">Acknowledge + done</option></select></div><div class="field" style="align-self:end;"><button class="btn" type="submit">Add flow</button></div>
+        </form>
+      </details>
+      <div class="flow-tile-grid">{% for item in request_types %}<a class="flow-preview" href="{{ url_for('admin_edit_request_type', type_id=item.id) }}" style="background:{{ item.button_color }};">{{ item.label }}</a>{% endfor %}</div>
     </details>
 
     <details id="desk-profiles" class="panel admin-section">
-      <summary>Dispatcher desk profiles</summary>
-      <p>Create standard dashboards such as Central South, then assign the queues that should load by default.</p>
-      <form method="post" action="{{ url_for('admin_create_desk_profile') }}" class="grid three">
-        <div class="field"><label>Desk name</label><input name="name" placeholder="Central South" required></div>
-        <div class="field"><label>Description</label><input name="description" placeholder="Clandeboye and Darfield standard profile"></div>
-        <div class="field"><label>Sort</label><input name="sort_order" type="number" value="100"></div>
-        <div class="field" style="grid-column: 1 / -1;">
-          <label>Queues in this desk</label>
-          <div class="inline">
-            {% for group in groups_all %}
-              <label class="chip"><input type="checkbox" name="group_id" value="{{ group.id }}" style="width: auto; min-height: 0;"> {{ group.name }}</label>
-            {% endfor %}
-          </div>
-        </div>
-        <label class="chip"><input type="checkbox" name="is_default" style="width: auto; min-height: 0;"> Standard default</label>
-        <div><button class="btn" type="submit">Add desk profile</button></div>
-      </form>
-      <div class="list" style="margin-top: 12px;">
-        {% for profile in desk_profiles %}
-          <div class="item grid three">
-            <form id="desk-save-{{ profile.id }}" method="post" action="{{ url_for('admin_update_desk_profile', profile_id=profile.id) }}"></form>
-            <div class="field"><label>Name</label><input form="desk-save-{{ profile.id }}" name="name" value="{{ profile.name }}" required></div>
-            <div class="field"><label>Description</label><input form="desk-save-{{ profile.id }}" name="description" value="{{ profile.description or '' }}"></div>
-            <div class="field"><label>Sort</label><input form="desk-save-{{ profile.id }}" name="sort_order" type="number" value="{{ profile.sort_order }}"></div>
-            <div class="field" style="grid-column: 1 / -1;">
-              <label>Queues</label>
-              <div class="inline">
-                {% for group in groups_all %}
-                  <label class="chip"><input form="desk-save-{{ profile.id }}" type="checkbox" name="group_id" value="{{ group.id }}" style="width: auto; min-height: 0;" {% if group.id in profile.group_ids %}checked{% endif %}> {{ group.name }}</label>
-                {% endfor %}
-              </div>
-            </div>
-            <label class="chip"><input form="desk-save-{{ profile.id }}" type="checkbox" name="active" style="width: auto; min-height: 0;" {% if profile.active %}checked{% endif %}> Active</label>
-            <label class="chip"><input form="desk-save-{{ profile.id }}" type="checkbox" name="is_default" style="width: auto; min-height: 0;" {% if profile.is_default %}checked{% endif %}> Standard default</label>
-            <div class="split-actions">
-              <button class="btn secondary" form="desk-save-{{ profile.id }}" type="submit">Save desk</button>
-              <form method="post" action="{{ url_for('admin_delete_desk_profile', profile_id=profile.id) }}" onsubmit="return confirm('Delete this desk profile?');">
-                <button class="btn red" type="submit">Delete</button>
-              </form>
-            </div>
-          </div>
-        {% endfor %}
-      </div>
+      <summary>Dispatcher desk profiles <span class="small">{{ desk_profiles|length }}</span></summary>
+      <details class="admin-create"><summary class="btn secondary compact" style="width:max-content;">Add desk profile</summary>
+        <form method="post" action="{{ url_for('admin_create_desk_profile') }}" class="grid three" style="margin-top:12px;">
+          <div class="field"><label>Desk name</label><input name="name" required></div><div class="field"><label>Description</label><input name="description"></div><div class="field"><label>Sort</label><input name="sort_order" type="number" value="100"></div>
+          <div class="field" style="grid-column:1/-1;"><label>Queues</label><div class="choice-tiles">{% for group in groups_all %}<label class="chip"><input type="checkbox" name="group_id" value="{{ group.id }}" style="width:auto;min-height:0;"> {{ group.name }}</label>{% endfor %}</div></div>
+          <label class="chip"><input type="checkbox" name="is_default" style="width:auto;min-height:0;"> Standard default</label><div><button class="btn" type="submit">Add desk</button></div>
+        </form>
+      </details>
+      {% for profile in desk_profiles %}
+        <details class="compact-record">
+          <summary><span class="record-title"><strong>{{ profile.name }}</strong><span>{{ profile.description or 'No description' }}</span></span><span>{{ profile.group_ids|length }} queue{{ '' if profile.group_ids|length == 1 else 's' }}</span><span class="status-badge {{ 'active' if profile.active else 'inactive' }}">{{ 'Active' if profile.active else 'Inactive' }}</span></summary>
+          <div class="record-body"><form id="desk-save-{{ profile.id }}" method="post" action="{{ url_for('admin_update_desk_profile', profile_id=profile.id) }}" class="grid three">
+            <div class="field"><label>Name</label><input name="name" value="{{ profile.name }}" required></div><div class="field"><label>Description</label><input name="description" value="{{ profile.description or '' }}"></div><div class="field"><label>Sort</label><input name="sort_order" type="number" value="{{ profile.sort_order }}"></div>
+            <div class="field" style="grid-column:1/-1;"><label>Queues</label><div class="choice-tiles">{% for group in groups_all %}<label class="chip"><input type="checkbox" name="group_id" value="{{ group.id }}" style="width:auto;min-height:0;" {% if group.id in profile.group_ids %}checked{% endif %}> {{ group.name }}</label>{% endfor %}</div></div>
+            <label class="chip"><input type="checkbox" name="active" style="width:auto;min-height:0;" {% if profile.active %}checked{% endif %}> Active</label><label class="chip"><input type="checkbox" name="is_default" style="width:auto;min-height:0;" {% if profile.is_default %}checked{% endif %}> Standard default</label>
+          </form><div class="record-actions"><button class="btn secondary" form="desk-save-{{ profile.id }}" type="submit">Save desk</button><form method="post" action="{{ url_for('admin_delete_desk_profile', profile_id=profile.id) }}" onsubmit="return confirm('Delete this desk profile?');"><button class="btn red" type="submit">Delete</button></form></div></div>
+        </details>
+      {% endfor %}
     </details>
 
     <div class="grid two">
       <details id="queues" class="panel admin-section">
-        <summary>Dashboard queues</summary>
-        <form method="post" action="{{ url_for('admin_create_group') }}" class="inline">
-          <input name="name" placeholder="Queue name" required>
-          <input name="sort_order" type="number" value="100" style="width: 120px;">
-          <button class="btn" type="submit">Add queue</button>
-        </form>
-        <div class="list" style="margin-top: 12px;">
-          {% for item in groups_all %}
-            <div class="item inline">
-              <form id="queue-save-{{ item.id }}" method="post" action="{{ url_for('admin_update_group', group_id=item.id) }}"></form>
-              <input form="queue-save-{{ item.id }}" name="name" value="{{ item.name }}" required>
-              <input form="queue-save-{{ item.id }}" name="sort_order" type="number" value="{{ item.sort_order }}" style="width: 100px;">
-              <label class="chip"><input form="queue-save-{{ item.id }}" type="checkbox" name="active" style="width: auto; min-height: 0;" {% if item.active %}checked{% endif %}> Active</label>
-              <button class="btn secondary" form="queue-save-{{ item.id }}" type="submit">Save</button>
-              <form method="post" action="{{ url_for('admin_delete_group', group_id=item.id) }}" onsubmit="return confirm('Delete this queue? Depots using it will become unassigned.');">
-                <button class="btn red" type="submit">Delete</button>
-              </form>
-            </div>
-          {% endfor %}
-        </div>
+        <summary>Dashboard queues <span class="small">{{ groups_all|length }}</span></summary>
+        <details class="admin-create"><summary class="btn secondary compact" style="width:max-content;">Add queue</summary><form method="post" action="{{ url_for('admin_create_group') }}" class="inline" style="margin-top:10px;"><input name="name" placeholder="Queue name" required><input name="sort_order" type="number" value="100" style="width:110px;"><button class="btn" type="submit">Add</button></form></details>
+        {% for item in groups_all %}<details class="compact-record"><summary><span class="record-title"><strong>{{ item.name }}</strong><span>Sort {{ item.sort_order }}</span></span><span>Queue</span><span class="status-badge {{ 'active' if item.active else 'inactive' }}">{{ 'Active' if item.active else 'Inactive' }}</span></summary><div class="record-body"><form id="queue-save-{{ item.id }}" method="post" action="{{ url_for('admin_update_group', group_id=item.id) }}" class="grid three"><div class="field"><label>Name</label><input name="name" value="{{ item.name }}" required></div><div class="field"><label>Sort</label><input name="sort_order" type="number" value="{{ item.sort_order }}"></div><label class="chip"><input type="checkbox" name="active" style="width:auto;min-height:0;" {% if item.active %}checked{% endif %}> Active</label></form><div class="record-actions"><button class="btn secondary" form="queue-save-{{ item.id }}" type="submit">Save queue</button><form method="post" action="{{ url_for('admin_delete_group', group_id=item.id) }}" onsubmit="return confirm('Delete this queue? Depots using it will become unassigned.');"><button class="btn red" type="submit">Delete</button></form></div></div></details>{% endfor %}
       </details>
 
       <details id="depots" class="panel admin-section">
-        <summary>Depots and routing</summary>
-        <form method="post" action="{{ url_for('admin_create_depot') }}" class="grid three">
-          <div class="field"><label>Name</label><input name="name" required></div>
-          <div class="field">
-            <label>Queue</label>
-            <select name="dispatcher_group_id">
-              {% for group in groups_all %}
-                <option value="{{ group.id }}">{{ group.name }}</option>
-              {% endfor %}
-            </select>
-          </div>
-          <div class="field"><label>Sort</label><input name="sort_order" type="number" value="100"></div>
-          <div><button class="btn" type="submit">Add depot</button></div>
-        </form>
-        <div class="list" style="margin-top: 12px;">
-          {% for depot in depots_all %}
-            <div class="item grid three">
-              <form id="depot-save-{{ depot.id }}" method="post" action="{{ url_for('admin_update_depot', depot_id=depot.id) }}"></form>
-              <input form="depot-save-{{ depot.id }}" name="name" value="{{ depot.name }}" required>
-              <select form="depot-save-{{ depot.id }}" name="dispatcher_group_id">
-                {% for group in groups_all %}
-                  <option value="{{ group.id }}" {% if depot.group_id == group.id %}selected{% endif %}>{{ group.name }}</option>
-                {% endfor %}
-              </select>
-              <input form="depot-save-{{ depot.id }}" name="sort_order" type="number" value="{{ depot.sort_order }}">
-              <label class="chip"><input form="depot-save-{{ depot.id }}" type="checkbox" name="active" style="width: auto; min-height: 0;" {% if depot.active %}checked{% endif %}> Active</label>
-              <button class="btn secondary" form="depot-save-{{ depot.id }}" type="submit">Save</button>
-              <form method="post" action="{{ url_for('admin_delete_depot', depot_id=depot.id) }}" onsubmit="return confirm('Delete this depot? Existing request history is kept.');">
-                <button class="btn red" type="submit">Delete</button>
-              </form>
-            </div>
-          {% endfor %}
-        </div>
+        <summary>Depots and routing <span class="small">{{ depots_all|length }}</span></summary>
+        <details class="admin-create"><summary class="btn secondary compact" style="width:max-content;">Add depot</summary><form method="post" action="{{ url_for('admin_create_depot') }}" class="grid three" style="margin-top:10px;"><div class="field"><label>Name</label><input name="name" required></div><div class="field"><label>Queue</label><select name="dispatcher_group_id">{% for group in groups_all %}<option value="{{ group.id }}">{{ group.name }}</option>{% endfor %}</select></div><div class="field"><label>Sort</label><input name="sort_order" type="number" value="100"></div><div><button class="btn" type="submit">Add depot</button></div></form></details>
+        {% for depot in depots_all %}<details class="compact-record"><summary><span class="record-title"><strong>{{ depot.name }}</strong><span>Sort {{ depot.sort_order }}</span></span><span class="routing-summary">{{ depot.group_name or 'Unassigned' }}{% if pending_by_depot.get(depot.id, 0) %} · <strong style="color:#92400e;">{{ pending_by_depot.get(depot.id, 0) }} pending</strong>{% endif %}</span><span class="status-badge {{ 'active' if depot.active else 'inactive' }}">{{ 'Active' if depot.active else 'Inactive' }}</span></summary><div class="record-body"><form id="depot-save-{{ depot.id }}" method="post" action="{{ url_for('admin_update_depot', depot_id=depot.id) }}" class="grid three"><div class="field"><label>Name</label><input name="name" value="{{ depot.name }}" required></div><div class="field"><label>Dashboard queue</label><select name="dispatcher_group_id">{% for group in groups_all %}<option value="{{ group.id }}" {% if depot.group_id == group.id %}selected{% endif %}>{{ group.name }}</option>{% endfor %}</select></div><div class="field"><label>Sort</label><input name="sort_order" type="number" value="{{ depot.sort_order }}"></div><label class="chip"><input type="checkbox" name="active" style="width:auto;min-height:0;" {% if depot.active %}checked{% endif %}> Active</label></form><div class="record-actions"><button class="btn secondary" form="depot-save-{{ depot.id }}" type="submit">Save depot</button><form method="post" action="{{ url_for('admin_delete_depot', depot_id=depot.id) }}" onsubmit="return confirm('Delete this depot? Existing request history is kept.');"><button class="btn red" type="submit">Delete</button></form></div></div></details>{% endfor %}
       </details>
     </div>
     <script>
-      document.querySelectorAll(".admin-section").forEach((section) => {
+      document.querySelectorAll('.admin-section').forEach((section) => {
         const key = `admin-section:${section.id}`;
         const saved = localStorage.getItem(key);
-        if (saved !== null) {
-          section.open = saved === "1";
-        }
-        section.addEventListener("toggle", () => {
-          localStorage.setItem(key, section.open ? "1" : "0");
-        });
+        if (saved !== null) section.open = saved === '1';
+        section.addEventListener('toggle', () => localStorage.setItem(key, section.open ? '1' : '0'));
       });
     </script>
     """
@@ -2872,6 +3111,8 @@ def admin_dashboard():
         groups_all=group_options(active_only=False),
         depots_all=depot_options(active_only=False),
         desk_profiles=desk_profile_options(active_only=False),
+        pending_by_depot=pending_by_depot,
+        total_pending=total_pending,
     )
     body = """
     <section class="hero">
@@ -2910,8 +3151,8 @@ def admin_dashboard():
                 </td>
                 <td>
                     <select name="role">
-                      {% for role in ['driver', 'dispatch', 'admin'] %}
-                        <option value="{{ role }}" {% if item.role == role %}selected{% endif %}>{{ role|title }}</option>
+                      {% for role in ['driver', 'dispatch', 'depot', 'admin'] %}
+                        <option value="{{ role }}" {% if item.effective_role == role %}selected{% endif %}>{{ role|title }}</option>
                       {% endfor %}
                     </select>
                 </td>
@@ -3065,20 +3306,23 @@ def get_request_type_admin(type_id):
 @roles_required("admin")
 def admin_create_user():
     values = require_form_values("username", "display_name", "password", "role")
-    if not values or values["role"] not in {"driver", "dispatch", "admin"}:
+    if not values or values["role"] not in {"driver", "dispatch", "depot", "admin"}:
         return redirect(url_for("admin_dashboard"))
+    storage_role = "driver" if values["role"] == "depot" else values["role"]
+    access_role = "depot" if values["role"] == "depot" else None
     try:
         execute(
             """
             INSERT INTO users
-                (username, display_name, password_hash, role, active, created_at)
-            VALUES (?, ?, ?, ?, 1, ?)
+                (username, display_name, password_hash, role, access_role, active, access_status, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, 'approved', ?)
             """,
             (
                 values["username"],
                 values["display_name"],
                 generate_password_hash(values["password"]),
-                values["role"],
+                storage_role,
+                access_role,
                 now_iso(),
             ),
         )
@@ -3092,16 +3336,18 @@ def admin_create_user():
 @roles_required("admin")
 def admin_update_user(user_id):
     values = require_form_values("username", "display_name", "role")
-    if not values or values["role"] not in {"driver", "dispatch", "admin"}:
+    if not values or values["role"] not in {"driver", "dispatch", "depot", "admin"}:
         return redirect(url_for("admin_dashboard"))
+    storage_role = "driver" if values["role"] == "depot" else values["role"]
+    access_role = "depot" if values["role"] == "depot" else None
     try:
         execute(
             """
             UPDATE users
-            SET username = ?, display_name = ?, role = ?
+            SET username = ?, display_name = ?, role = ?, access_role = ?
             WHERE id = ?
             """,
-            (values["username"], values["display_name"], values["role"], user_id),
+            (values["username"], values["display_name"], storage_role, access_role, user_id),
         )
         flash("User updated.")
     except sqlite3.IntegrityError:
@@ -3174,90 +3420,68 @@ def admin_create_request_type():
 @roles_required("admin")
 def admin_edit_request_type(type_id):
     item = get_request_type_admin(type_id)
+    fields = item["form_schema"].get("fields", [])
     body = """
-    <section class="hero">
+    <section class="hero"><div><h1>Edit driver option</h1><p>{{ item.label }}</p></div><a class="btn ghost" href="{{ url_for('admin_dashboard') }}#driver-flows">Back to admin</a></section>
+    <div class="grid two admin-flow-layout">
       <div>
-        <h1>Edit driver flow</h1>
-        <p>{{ item.label }}</p>
-      </div>
-      <a class="btn ghost" href="{{ url_for('admin_dashboard') }}#driver-flows">Back to admin</a>
-    </section>
-    <section class="panel" style="margin-bottom: 16px;">
-      <h2>Button settings</h2>
-      <form method="post" action="{{ url_for('admin_update_request_type', type_id=item.id) }}" class="grid three">
-        <div class="flow-preview" style="background: {{ item.button_color }};">{{ item.label }}</div>
-        <div class="field"><label>Label</label><input name="label" value="{{ item.label }}" required></div>
-        <div class="field"><label>Color</label><input name="button_color" type="color" value="{{ item.button_color }}"></div>
-        <div class="field"><label>Sort</label><input name="sort_order" type="number" value="{{ item.sort_order }}"></div>
-        <div class="field">
-          <label>Driver receipt</label>
-          <select name="receipt_mode">
-            <option value="none" {% if item.receipt_mode == 'none' %}selected{% endif %}>No driver receipt</option>
-            <option value="ack_only" {% if item.receipt_mode == 'ack_only' %}selected{% endif %}>Acknowledge only</option>
-            <option value="ack_done" {% if item.receipt_mode == 'ack_done' %}selected{% endif %}>Acknowledge + done</option>
-          </select>
-        </div>
-        <label class="chip"><input type="checkbox" name="active" style="width: auto; min-height: 0;" {% if item.active %}checked{% endif %}> Active</label>
-        <button class="btn secondary" type="submit">Save button</button>
-      </form>
-      <form method="post" action="{{ url_for('admin_delete_request_type', type_id=item.id) }}" onsubmit="return confirm('Delete this flow button? Existing request history is kept.');" style="margin-top: 12px;">
-        <button class="btn red" type="submit">Delete flow button</button>
-      </form>
-    </section>
-    <section class="panel">
-      <h2>Fields and tile choices</h2>
-      <form method="post" action="{{ url_for('admin_add_request_field', type_id=item.id) }}" class="grid three">
-        <div class="field"><label>Field label</label><input name="label" placeholder="CIP action" required></div>
-        <div class="field">
-          <label>Type</label>
-          <select name="type">
-            <option value="choice">Tile choices</option>
-            <option value="text">Text input</option>
-          </select>
-        </div>
-        <label class="chip"><input type="checkbox" name="required" style="width: auto; min-height: 0;" checked> Required</label>
-        <div class="field" style="grid-column: 1 / -1;">
-          <label>Choices, one per line</label>
-          <textarea name="choices" placeholder="Add CIP Start Of Day&#10;Add CIP End Of Day"></textarea>
-        </div>
-        <button class="btn" type="submit">Add field</button>
-      </form>
-      <div class="list" style="margin-top: 14px;">
-        {% for field in item.form_schema.fields %}
-          <div class="item">
-            <form method="post" action="{{ url_for('admin_update_request_field', type_id=item.id, field_index=loop.index0) }}" class="grid three">
-              <div class="field"><label>Label</label><input name="label" value="{{ field.label }}" required></div>
-              <div class="field"><label>Key</label><input name="name" value="{{ field.name }}" required></div>
-              <div class="field">
-                <label>Type</label>
-                <select name="type">
-                  <option value="choice" {% if field.type == 'choice' %}selected{% endif %}>Tile choices</option>
-                  <option value="text" {% if field.type == 'text' %}selected{% endif %}>Text input</option>
-                </select>
-              </div>
-              <label class="chip"><input type="checkbox" name="required" style="width: auto; min-height: 0;" {% if field.required %}checked{% endif %}> Required</label>
-              <div class="field" style="grid-column: 1 / -1;">
-                <label>Choices, one per line</label>
-                <textarea name="choices">{{ (field.choices or [])|join('\n') }}</textarea>
-              </div>
-              {% if field.show_when %}
-                <div class="field" style="grid-column: 1 / -1;">
-                  <span class="chip">Conditional: shows when {{ field.show_when.field }} is {{ field.show_when.equals }}</span>
-                </div>
-              {% endif %}
-              <button class="btn secondary" type="submit">Save field</button>
-            </form>
-            <form method="post" action="{{ url_for('admin_delete_request_field', type_id=item.id, field_index=loop.index0) }}" onsubmit="return confirm('Delete this field?');" style="margin-top: 8px;">
-              <button class="btn red" type="submit">Delete field</button>
-            </form>
+        <section class="panel" style="margin-bottom:16px;">
+          <h2>Button settings</h2>
+          <form method="post" action="{{ url_for('admin_update_request_type', type_id=item.id) }}" class="grid three">
+            <div class="flow-preview" style="background:{{ item.button_color }};">{{ item.label }}</div>
+            <div class="field"><label>Button label</label><input name="label" value="{{ item.label }}" required></div>
+            <div class="field"><label>Colour</label><input name="button_color" type="color" value="{{ item.button_color }}"></div>
+            <div class="field"><label>Position</label><input name="sort_order" type="number" value="{{ item.sort_order }}"></div>
+            <div class="field"><label>Driver receipt</label><select name="receipt_mode"><option value="none" {% if item.receipt_mode == 'none' %}selected{% endif %}>Sent only</option><option value="ack_only" {% if item.receipt_mode == 'ack_only' %}selected{% endif %}>Show acknowledgement</option><option value="ack_done" {% if item.receipt_mode == 'ack_done' %}selected{% endif %}>Show acknowledgement and done</option></select></div>
+            <label class="chip"><input type="checkbox" name="active" style="width:auto;min-height:0;" {% if item.active %}checked{% endif %}> Active</label>
+            <button class="btn secondary" type="submit">Save settings</button>
+          </form>
+          <div class="inline" style="margin-top:10px;">
+            <form method="post" action="{{ url_for('admin_duplicate_request_type', type_id=item.id) }}"><button class="btn ghost" type="submit">Duplicate option</button></form>
+            <form method="post" action="{{ url_for('admin_delete_request_type', type_id=item.id) }}" onsubmit="return confirm('Delete this option? Existing request history is kept.');"><button class="btn red" type="submit">Delete option</button></form>
           </div>
-        {% else %}
-          <div class="item"><p>No fields configured. This flow submits directly with the optional note.</p></div>
-        {% endfor %}
+        </section>
+        <section class="panel">
+          <div class="item-head"><div><h2>Questions</h2><p>Drivers see these one at a time.</p></div></div>
+          <div class="list admin-question-list">
+          {% for field in fields %}
+            <article class="item question-editor">
+              <div class="item-head"><strong>{{ loop.index }}. {{ field.label }}</strong><div class="inline">
+                <form method="post" action="{{ url_for('admin_move_request_field', type_id=item.id, field_index=loop.index0, direction='up') }}"><button class="btn ghost compact" type="submit" {% if loop.first %}disabled{% endif %}>↑</button></form>
+                <form method="post" action="{{ url_for('admin_move_request_field', type_id=item.id, field_index=loop.index0, direction='down') }}"><button class="btn ghost compact" type="submit" {% if loop.last %}disabled{% endif %}>↓</button></form>
+              </div></div>
+              <form method="post" action="{{ url_for('admin_update_request_field', type_id=item.id, field_index=loop.index0) }}" class="grid two">
+                <div class="field"><label>Question</label><input name="label" value="{{ field.label }}" required></div>
+                <div class="field"><label>Answer type</label><select name="type">
+                  <option value="choice" {% if field.type == 'choice' %}selected{% endif %}>Choice buttons</option><option value="yes_no" {% if field.type == 'yes_no' %}selected{% endif %}>Yes / No</option><option value="text" {% if field.type == 'text' %}selected{% endif %}>Short text</option><option value="number" {% if field.type == 'number' %}selected{% endif %}>Number</option><option value="note" {% if field.type == 'note' %}selected{% endif %}>Longer note</option>
+                </select></div>
+                <label class="chip"><input type="checkbox" name="required" style="width:auto;min-height:0;" {% if field.required %}checked{% endif %}> Required</label>
+                <div class="field choices-field" style="grid-column:1/-1;"><label>Choices — one per line</label><textarea name="choices">{{ (field.choices or [])|join('\n') }}</textarea></div>
+                <div class="field"><label>Show this question</label><select name="condition_field"><option value="">Always</option>{% for controller in fields[:loop.index0] %}{% if controller.type in ['choice','yes_no'] %}<option value="{{ controller.name }}" {% if field.show_when and field.show_when.field == controller.name %}selected{% endif %}>When “{{ controller.label }}”...</option>{% endif %}{% endfor %}</select></div>
+                <div class="field"><label>...equals</label><input name="condition_equals" value="{{ field.show_when.equals if field.show_when else '' }}" placeholder="Exact answer"></div>
+                <button class="btn secondary" type="submit">Save question</button>
+              </form>
+              <form method="post" action="{{ url_for('admin_delete_request_field', type_id=item.id, field_index=loop.index0) }}" onsubmit="return confirm('Delete this question?');" style="margin-top:8px;"><button class="btn red compact" type="submit">Delete</button></form>
+            </article>
+          {% else %}<div class="item"><p>No questions. Selecting this option goes straight to review and send.</p></div>{% endfor %}
+          </div>
+          <hr style="border:0;border-top:1px solid var(--line);margin:18px 0;">
+          <h3>Add question</h3>
+          <form method="post" action="{{ url_for('admin_add_request_field', type_id=item.id) }}" class="grid two">
+            <div class="field"><label>Question</label><input name="label" placeholder="How much was left behind?" required></div>
+            <div class="field"><label>Answer type</label><select name="type"><option value="choice">Choice buttons</option><option value="yes_no">Yes / No</option><option value="text">Short text</option><option value="number">Number</option><option value="note">Longer note</option></select></div>
+            <label class="chip"><input type="checkbox" name="required" style="width:auto;min-height:0;" checked> Required</label>
+            <div class="field" style="grid-column:1/-1;"><label>Choices — one per line</label><textarea name="choices" placeholder="0–500 L&#10;500–1000 L&#10;1000 L+"></textarea></div>
+            <div class="field"><label>Show this question</label><select name="condition_field"><option value="">Always</option>{% for controller in fields %}{% if controller.type in ['choice','yes_no'] %}<option value="{{ controller.name }}">When “{{ controller.label }}”...</option>{% endif %}{% endfor %}</select></div>
+            <div class="field"><label>...equals</label><input name="condition_equals" placeholder="Exact answer"></div>
+            <button class="btn" type="submit">Add question</button>
+          </form>
+        </section>
       </div>
-    </section>
+      <aside class="panel admin-preview"><h2>Driver preview</h2><div class="flow-preview" style="background:{{ item.button_color }};">{{ item.label }}</div><div class="preview-phone"><div class="small">Questions in order</div>{% for field in fields %}<div class="preview-question"><strong>{{ loop.index }}. {{ field.label }}</strong><div class="small">{{ field.type|replace('_',' ')|title }}{% if field.show_when %} · conditional{% endif %}</div></div>{% else %}<p>Sends directly.</p>{% endfor %}</div></aside>
+    </div>
     """
-    return render_page("Edit Flow", body, item=item)
+    return render_page("Edit Flow", body, item=item, fields=fields)
 
 
 @app.route("/admin/request-types/<int:type_id>/update", methods=["POST"])
@@ -3283,6 +3507,19 @@ def admin_update_request_type(type_id):
     )
     flash("Request button updated.")
     return redirect(url_for("admin_edit_request_type", type_id=type_id))
+
+
+@app.route("/admin/request-types/<int:type_id>/duplicate", methods=["POST"])
+@roles_required("admin")
+def admin_duplicate_request_type(type_id):
+    item = get_request_type_admin(type_id)
+    label = f"{item['label']} Copy"
+    sort_order = int(item.get("sort_order") or 100) + 1
+    with get_db() as db:
+        cursor = db.execute("INSERT INTO request_types (label, sort_order, active, button_color, form_schema) VALUES (?, ?, 0, ?, ?)", (label, sort_order, item["button_color"], json.dumps(item["form_schema"])))
+        new_id = cursor.lastrowid
+    flash("Option duplicated. Review it, then make it active.")
+    return redirect(url_for("admin_edit_request_type", type_id=new_id))
 
 
 @app.route("/admin/request-types/<int:type_id>/delete", methods=["POST"])
@@ -3317,14 +3554,19 @@ def admin_add_request_field(type_id):
         flash("Field label is required.")
         return redirect(url_for("admin_edit_request_type", type_id=type_id))
     field_type = request.form.get("type", "choice")
-    field = {
-        "name": slugify_key(label),
-        "label": label,
-        "type": field_type if field_type in {"choice", "text"} else "choice",
-        "required": bool(request.form.get("required")),
-    }
-    if field["type"] == "choice":
-        field["choices"] = choices_from_form()
+    allowed_types = {"choice", "yes_no", "text", "number", "note"}
+    base_name = slugify_key(label) or "question"
+    used_names = {field.get("name") for field in item["form_schema"].get("fields", [])}
+    field_name = base_name
+    suffix = 2
+    while field_name in used_names:
+        field_name = f"{base_name}_{suffix}"
+        suffix += 1
+    field = {"id": field_name, "name": field_name, "label": label, "type": field_type if field_type in allowed_types else "choice", "required": bool(request.form.get("required"))}
+    if field["type"] == "choice": field["choices"] = choices_from_form()
+    condition_field = request.form.get("condition_field", "").strip()
+    condition_equals = request.form.get("condition_equals", "").strip()
+    if condition_field and condition_equals: field["show_when"] = {"field": condition_field, "equals": condition_equals}
     item["form_schema"].setdefault("fields", []).append(field)
     save_request_schema(type_id, item["form_schema"])
     flash("Field added.")
@@ -3340,18 +3582,27 @@ def admin_update_request_field(type_id, field_index):
         abort(404)
     existing_field = fields[field_index]
     field_type = request.form.get("type", "choice")
-    fields[field_index] = {
-        "name": slugify_key(request.form.get("name", "")),
-        "label": request.form.get("label", "").strip() or "Field",
-        "type": field_type if field_type in {"choice", "text"} else "choice",
-        "required": bool(request.form.get("required")),
-    }
-    if fields[field_index]["type"] == "choice":
-        fields[field_index]["choices"] = choices_from_form()
-    if existing_field.get("show_when"):
-        fields[field_index]["show_when"] = existing_field["show_when"]
+    allowed_types = {"choice", "yes_no", "text", "number", "note"}
+    stable_name = existing_field.get("name") or slugify_key(existing_field.get("label", "question"))
+    fields[field_index] = {"id": existing_field.get("id", stable_name), "name": stable_name, "label": request.form.get("label", "").strip() or "Question", "type": field_type if field_type in allowed_types else "choice", "required": bool(request.form.get("required"))}
+    if fields[field_index]["type"] == "choice": fields[field_index]["choices"] = choices_from_form()
+    condition_field = request.form.get("condition_field", "").strip()
+    condition_equals = request.form.get("condition_equals", "").strip()
+    if condition_field and condition_equals: fields[field_index]["show_when"] = {"field": condition_field, "equals": condition_equals}
     save_request_schema(type_id, item["form_schema"])
     flash("Field updated.")
+    return redirect(url_for("admin_edit_request_type", type_id=type_id))
+
+
+@app.route("/admin/request-types/<int:type_id>/fields/<int:field_index>/move/<direction>", methods=["POST"])
+@roles_required("admin")
+def admin_move_request_field(type_id, field_index, direction):
+    item = get_request_type_admin(type_id)
+    fields = item["form_schema"].setdefault("fields", [])
+    target = field_index - 1 if direction == "up" else field_index + 1
+    if 0 <= field_index < len(fields) and 0 <= target < len(fields):
+        fields[field_index], fields[target] = fields[target], fields[field_index]
+        save_request_schema(type_id, item["form_schema"])
     return redirect(url_for("admin_edit_request_type", type_id=type_id))
 
 
